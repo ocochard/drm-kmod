@@ -58,8 +58,25 @@
 #define	ISP_ENTRY_SIZE		64	/* command and response entries */
 #define	ISP_POOL_SIZE		(100 * 1024 * 1024)
 
+#define	ISP_CMD_SET_STREAM_CONFIG 0x02010001
+#define	ISP_CMD_SET_OUT_CHAN_PROP 0x02010003
+#define	ISP_CMD_ENABLE_OUT_CHAN	0x02010005
+#define	ISP_CMD_START_STREAM	0x02010007
+#define	ISP_CMD_STOP_STREAM	0x02010008
 #define	ISP_CMD_SEND_BUFFER	0x02040001
 #define	ISP_BUF_TYPE_POOL	0xf
+#define	ISP_BUF_TYPE_META	0xa
+#define	ISP_BUF_TYPE_FRAME	0x8
+#define	ISP_RESP_CMD_DONE	0x00010001
+#define	ISP_RESP_FRAME_DONE	0x00030001
+
+#define	ISP_NMETA		8
+#define	ISP_META_SIZE		0x8000
+#define	ISP_NFRAME		4
+#define	ISP_WIDTH		1920
+#define	ISP_HEIGHT		1080
+#define	ISP_Y_SIZE		(ISP_WIDTH * ISP_HEIGHT)
+#define	ISP_FRAME_SIZE		(ISP_Y_SIZE * 3 / 2)	/* NV12 */
 
 /* Ring base register (low address) and its slot in the ring buffer. */
 static const struct {
@@ -82,6 +99,10 @@ static uint64_t isp_ring_gpu, isp_log_gpu, isp_pool_gpu;
 static void *isp_ring_cpu, *isp_log_cpu, *isp_pool_cpu;
 static int isp_booted;
 static uint32_t isp_cmd_seq;
+static struct amdgpu_bo *isp_meta_bo[ISP_NMETA], *isp_frame_bo[ISP_NFRAME];
+static uint64_t isp_meta_gpu[ISP_NMETA], isp_frame_gpu[ISP_NFRAME];
+static void *isp_meta_cpu[ISP_NMETA], *isp_frame_cpu[ISP_NFRAME];
+static int isp_last_frame = -1;
 
 static void
 isp_ring_set(struct amdgpu_device *adev, uint32_t reg, uint64_t gpu,
@@ -111,6 +132,13 @@ isp_free(struct amdgpu_device *adev)
 	amdgpu_bo_free_kernel(&isp_ring_bo, &isp_ring_gpu, &isp_ring_cpu);
 	amdgpu_bo_free_kernel(&isp_log_bo, &isp_log_gpu, &isp_log_cpu);
 	amdgpu_bo_free_kernel(&isp_pool_bo, &isp_pool_gpu, &isp_pool_cpu);
+	for (int i = 0; i < ISP_NMETA; i++)
+		amdgpu_bo_free_kernel(&isp_meta_bo[i], &isp_meta_gpu[i],
+		    &isp_meta_cpu[i]);
+	for (int i = 0; i < ISP_NFRAME; i++)
+		amdgpu_bo_free_kernel(&isp_frame_bo[i], &isp_frame_gpu[i],
+		    &isp_frame_cpu[i]);
+	isp_last_frame = -1;
 }
 
 /*
@@ -150,9 +178,12 @@ isp_send_cmd(struct amdgpu_device *adev, uint32_t id, const uint32_t *payload,
 	return (0);
 }
 
+static void isp_frame_done(uint64_t meta_gpu);
+static int isp_send_pool(struct amdgpu_device *adev);
+
 /* Poll the response ring for up to timeout_ms, printing each response. */
 static int
-isp_poll_resp(struct amdgpu_device *adev, int timeout_ms)
+isp_poll_resp_type(struct amdgpu_device *adev, int timeout_ms, uint32_t want)
 {
 	uint32_t e[ISP_ENTRY_SIZE / 4], rptr, wptr, st, sum;
 	uint8_t *ring;
@@ -174,11 +205,15 @@ isp_poll_resp(struct amdgpu_device *adev, int timeout_ms)
 			for (sum = 0, i = 0; i < 15; i++)
 				sum += e[i];
 			printf("amdisp: resp seq %u type 0x%08x w2 0x%x w3 0x%x "
-			    "w4 0x%x w5 0x%x checksum %s\n", e[0], e[1], e[2],
-			    e[3], e[4], e[5], sum == e[15] ? "ok" : "BAD");
+			    "w4 0x%x w5 0x%x checksum %s at %d ms\n", e[0], e[1],
+			    e[2], e[3], e[4], e[5], sum == e[15] ? "ok" : "BAD",
+			    t);
 			rptr = (rptr + ISP_ENTRY_SIZE) % ISP_RING_SIZE;
 			ISP_WR(adev, ISP_RESP_RPTR, rptr);
-			n++;
+			if (e[1] == ISP_RESP_FRAME_DONE)
+				isp_frame_done((uint64_t)e[3] << 32 | e[2]);
+			if (want == 0 || e[1] == want)
+				n++;
 		}
 		if (n > 0)
 			return (0);
@@ -187,6 +222,134 @@ isp_poll_resp(struct amdgpu_device *adev, int timeout_ms)
 	printf("amdisp: no response after %d ms (cmd rptr 0x%x wptr 0x%x)\n",
 	    timeout_ms, ISP_RD(adev, ISP_CMD_RPTR), ISP_RD(adev, ISP_CMD_WPTR));
 	return (ETIMEDOUT);
+}
+
+static int
+isp_poll_resp(struct amdgpu_device *adev, int timeout_ms)
+{
+	return (isp_poll_resp_type(adev, timeout_ms, 0));
+}
+
+/* Send a command and wait for its "command done". */
+static int
+isp_cmd_wait(struct amdgpu_device *adev, uint32_t id, const uint32_t *p,
+    int n)
+{
+	int r;
+
+	r = isp_send_cmd(adev, id, p, n);
+	if (r == 0)
+		r = isp_poll_resp_type(adev, 500, ISP_RESP_CMD_DONE);
+	return (r);
+}
+
+/* A finished frame: the meta info tells which frame buffer it is. */
+static void
+isp_frame_done(uint64_t meta_gpu)
+{
+	uint32_t *m, status, w, h;
+	uint64_t y;
+	uint8_t *f;
+	uint64_t sum;
+	int i, j;
+
+	for (i = 0; i < ISP_NMETA; i++)
+		if (isp_meta_gpu[i] == meta_gpu)
+			break;
+	if (i == ISP_NMETA) {
+		printf("amdisp: frame done with unknown meta 0x%llx\n",
+		    (unsigned long long)meta_gpu);
+		return;
+	}
+	m = isp_meta_cpu[i];
+	status = m[0x14 / 4];
+	w = m[0x34 / 4];
+	h = m[0x38 / 4];
+	y = (uint64_t)m[0x54 / 4] << 32 | m[0x50 / 4];
+	for (j = 0; j < ISP_NFRAME; j++)
+		if (isp_frame_gpu[j] == y)
+			break;
+	printf("amdisp: meta %d: frame %u status %u %ux%u Y 0x%llx -> buffer %d\n",
+	    i, m[0], status, w, h, (unsigned long long)y, j);
+	if (j == ISP_NFRAME)
+		return;
+	f = isp_frame_cpu[j];
+	for (sum = 0, i = 0; i < ISP_Y_SIZE; i += 4093)
+		sum += f[i];
+	printf("amdisp: buffer %d mean Y %llu\n", j,
+	    (unsigned long long)(sum / (ISP_Y_SIZE / 4093 + 1)));
+	isp_last_frame = j;
+}
+
+/*
+ * Stream set-up as measured on Linux, then wait for one frame: stream
+ * configuration, NV12 1920x1080 on the preview channel, eight meta info
+ * buffers, four frame buffers, start.
+ */
+static int
+isp_one_frame(struct amdgpu_device *adev)
+{
+	uint32_t cfg[5] = { 1, 0, 0x5f91, 1, 0 };
+	uint32_t prop[7] = { 0, 1, ISP_WIDTH, ISP_HEIGHT, ISP_WIDTH,
+	    ISP_WIDTH, 0 };
+	uint32_t en[2] = { 0, 1 }, dis[2] = { 0, 0 };
+	uint32_t p[9];
+	uint64_t uv;
+	int i, r;
+
+	if ((r = isp_send_pool(adev)) != 0)
+		return (r);
+	if ((r = isp_cmd_wait(adev, ISP_CMD_SET_STREAM_CONFIG, cfg,
+	    nitems(cfg))) != 0 ||
+	    (r = isp_cmd_wait(adev, ISP_CMD_SET_OUT_CHAN_PROP, prop,
+	    nitems(prop))) != 0 ||
+	    (r = isp_cmd_wait(adev, ISP_CMD_ENABLE_OUT_CHAN, en,
+	    nitems(en))) != 0)
+		return (r);
+
+	for (i = 0; i < ISP_NMETA; i++) {
+		if (isp_meta_bo[i] == NULL &&
+		    (r = amdgpu_bo_create_kernel(adev, ISP_META_SIZE,
+		    PAGE_SIZE, AMDGPU_GEM_DOMAIN_GTT, &isp_meta_bo[i],
+		    &isp_meta_gpu[i], &isp_meta_cpu[i])) != 0)
+			return (r);
+		memset(isp_meta_cpu[i], 0, ISP_META_SIZE);
+		memset(p, 0, sizeof(p));
+		p[0] = ISP_BUF_TYPE_META;
+		p[2] = 4;
+		p[3] = lower_32_bits(isp_meta_gpu[i]);
+		p[4] = upper_32_bits(isp_meta_gpu[i]);
+		p[5] = ISP_META_SIZE;
+		if ((r = isp_cmd_wait(adev, ISP_CMD_SEND_BUFFER, p, 6)) != 0)
+			return (r);
+	}
+	for (i = 0; i < ISP_NFRAME; i++) {
+		if (isp_frame_bo[i] == NULL &&
+		    (r = amdgpu_bo_create_kernel(adev, ISP_FRAME_SIZE,
+		    PAGE_SIZE, AMDGPU_GEM_DOMAIN_GTT, &isp_frame_bo[i],
+		    &isp_frame_gpu[i], &isp_frame_cpu[i])) != 0)
+			return (r);
+		memset(isp_frame_cpu[i], 0, ISP_FRAME_SIZE);
+		uv = isp_frame_gpu[i] + ISP_Y_SIZE;
+		memset(p, 0, sizeof(p));
+		p[0] = ISP_BUF_TYPE_FRAME;
+		p[2] = 4;
+		p[3] = lower_32_bits(isp_frame_gpu[i]);
+		p[4] = upper_32_bits(isp_frame_gpu[i]);
+		p[5] = ISP_Y_SIZE;
+		p[6] = lower_32_bits(uv);
+		p[7] = upper_32_bits(uv);
+		p[8] = ISP_Y_SIZE / 2;
+		if ((r = isp_cmd_wait(adev, ISP_CMD_SEND_BUFFER, p, 9)) != 0)
+			return (r);
+	}
+	if ((r = isp_cmd_wait(adev, ISP_CMD_START_STREAM, NULL, 0)) != 0)
+		return (r);
+	r = isp_poll_resp_type(adev, 2000, ISP_RESP_FRAME_DONE);
+
+	isp_cmd_wait(adev, ISP_CMD_ENABLE_OUT_CHAN, dis, nitems(dis));
+	isp_cmd_wait(adev, ISP_CMD_STOP_STREAM, NULL, 0);
+	return (r);
 }
 
 /* First command: give the firmware its working memory, as Linux does. */
@@ -323,11 +486,26 @@ isp_cmd_sysctl(SYSCTL_HANDLER_ARGS)
 		return (ENXIO);
 	if (val == 1)
 		return (isp_send_pool(isp_adev));
+	if (val == 2)
+		return (isp_one_frame(isp_adev));
 	return (EINVAL);
 }
 SYSCTL_PROC(_hw_amdgpu, OID_AUTO, isp_cmd,
     CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_MPSAFE, NULL, 0, isp_cmd_sysctl, "I",
-    "ISP command test: 1 sends the memory pool and waits for the response");
+    "ISP command test: 1 sends the memory pool, 2 sets up a stream and waits for one frame");
+
+/* The last finished frame, NV12 1920x1080, for a check from user space. */
+static int
+isp_frame_sysctl(SYSCTL_HANDLER_ARGS)
+{
+	if (isp_last_frame < 0 || isp_frame_cpu[isp_last_frame] == NULL)
+		return (ENOENT);
+	return (SYSCTL_OUT(req, isp_frame_cpu[isp_last_frame],
+	    ISP_FRAME_SIZE));
+}
+SYSCTL_PROC(_hw_amdgpu, OID_AUTO, isp_frame,
+    CTLTYPE_OPAQUE | CTLFLAG_RD | CTLFLAG_MPSAFE, NULL, 0, isp_frame_sysctl,
+    "", "Last ISP frame (NV12 1920x1080)");
 
 SYSCTL_PROC(_hw_amdgpu, OID_AUTO, isp_boot,
     CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_MPSAFE, NULL, 0, isp_boot_sysctl, "I",
