@@ -19,6 +19,7 @@
 #include <sys/kernel.h>
 #include <sys/module.h>
 #include <sys/sysctl.h>
+#include <sys/time.h>
 #include <sys/errno.h>
 #include <machine/atomic.h>
 
@@ -337,6 +338,54 @@ isp_watch_i2c(int ms)
 }
 
 /*
+ * Same registers as isp_watch_i2c(), sampled in a tight loop and recorded
+ * in memory (printing would slow the loop): every change of target,
+ * status, raw interrupts or abort source, with the time in microseconds.
+ */
+#define	ISP_WATCH_MAX	2000
+static struct {
+	uint32_t	us, tar, st, raw, abrt, txfl;
+} isp_ev[ISP_WATCH_MAX];
+
+static void
+isp_watch_fast(int ms)
+{
+	sbintime_t t0, end;
+	uint32_t tar, st, raw, abrt, txfl, p[4];
+	int i, n;
+
+	memset(p, 0xff, sizeof(p));
+	t0 = sbinuptime();
+	end = t0 + ms * SBT_1MS;
+	for (n = 0; sbinuptime() < end && n < ISP_WATCH_MAX; ) {
+		tar = ISP_RD(0x66404);
+		st = ISP_RD(0x66470);
+		raw = ISP_RD(0x66434);
+		abrt = ISP_RD(0x66480);
+		if (tar == p[0] && st == p[1] && raw == p[2] && abrt == p[3])
+			continue;
+		txfl = ISP_RD(0x66474);
+		isp_ev[n].us = (uint32_t)((sbinuptime() - t0) / SBT_1US);
+		isp_ev[n].tar = tar;
+		isp_ev[n].st = st;
+		isp_ev[n].raw = raw;
+		isp_ev[n].abrt = abrt;
+		isp_ev[n].txfl = txfl;
+		p[0] = tar; p[1] = st; p[2] = raw; p[3] = abrt;
+		n++;
+	}
+	printf("amdisp: fast watch: %d changes\n", n);
+	/* Print target and abort changes, and the first 60 events. */
+	for (i = 0; i < n; i++)
+		if (i < 60 || (i > 0 && (isp_ev[i].tar != isp_ev[i - 1].tar ||
+		    isp_ev[i].abrt != isp_ev[i - 1].abrt)))
+			printf("amdisp: f %6u us tar 0x%x st 0x%x raw 0x%x "
+			    "abrt 0x%x txfl %u\n", isp_ev[i].us, isp_ev[i].tar,
+			    isp_ev[i].st, isp_ev[i].raw, isp_ev[i].abrt,
+			    isp_ev[i].txfl);
+}
+
+/*
  * Stream set-up as measured on Linux, then wait for one frame: stream
  * configuration, NV12 1920x1080 on the preview channel, eight meta info
  * buffers, four frame buffers, start.
@@ -366,7 +415,7 @@ isp_one_frame(void)
 	if ((r = isp_send_cmd(ISP_CMD_SET_STREAM_CONFIG, cfg,
 	    nitems(cfg))) != 0)
 		return (r);
-	isp_watch_i2c(400);
+	isp_watch_fast(200);
 	if ((r = isp_poll_resp_type(500, ISP_RESP_CMD_DONE)) != 0 ||
 	    (r = isp_cmd_wait(ISP_CMD_SET_OUT_CHAN_PROP, prop,
 	    nitems(prop))) != 0 ||
