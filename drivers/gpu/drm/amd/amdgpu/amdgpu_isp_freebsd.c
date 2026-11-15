@@ -41,6 +41,25 @@
 #define	ISP_LOG_RING		0x62148
 #define	ISP_LOG_SIZE		0x200000
 #define	ISP_BOOT_READY		0x2402
+#define	ISP_INT_STATUS		0x62014
+#define	ISP_INT_ACK		0x62018
+
+/* Command ring: slot 0, pointers at +0xc (read) and +0x10 (write). */
+#define	ISP_CMD_RING		0x62170
+#define	ISP_CMD_RPTR		(ISP_CMD_RING + 0xc)
+#define	ISP_CMD_WPTR		(ISP_CMD_RING + 0x10)
+#define	ISP_CMD_SLOT		0
+/* Response ring: slot 8. */
+#define	ISP_RESP_RING		0x62210
+#define	ISP_RESP_RPTR		(ISP_RESP_RING + 0xc)
+#define	ISP_RESP_WPTR		(ISP_RESP_RING + 0x10)
+#define	ISP_RESP_SLOT		8
+
+#define	ISP_ENTRY_SIZE		64	/* command and response entries */
+#define	ISP_POOL_SIZE		(100 * 1024 * 1024)
+
+#define	ISP_CMD_SEND_BUFFER	0x02040001
+#define	ISP_BUF_TYPE_POOL	0xf
 
 /* Ring base register (low address) and its slot in the ring buffer. */
 static const struct {
@@ -58,10 +77,11 @@ static const struct {
 };
 
 static struct amdgpu_device *isp_adev;
-static struct amdgpu_bo *isp_ring_bo, *isp_log_bo;
-static uint64_t isp_ring_gpu, isp_log_gpu;
-static void *isp_ring_cpu, *isp_log_cpu;
+static struct amdgpu_bo *isp_ring_bo, *isp_log_bo, *isp_pool_bo;
+static uint64_t isp_ring_gpu, isp_log_gpu, isp_pool_gpu;
+static void *isp_ring_cpu, *isp_log_cpu, *isp_pool_cpu;
 static int isp_booted;
+static uint32_t isp_cmd_seq;
 
 static void
 isp_ring_set(struct amdgpu_device *adev, uint32_t reg, uint64_t gpu,
@@ -90,6 +110,111 @@ isp_free(struct amdgpu_device *adev)
 {
 	amdgpu_bo_free_kernel(&isp_ring_bo, &isp_ring_gpu, &isp_ring_cpu);
 	amdgpu_bo_free_kernel(&isp_log_bo, &isp_log_gpu, &isp_log_cpu);
+	amdgpu_bo_free_kernel(&isp_pool_bo, &isp_pool_gpu, &isp_pool_cpu);
+}
+
+/*
+ * A command or response entry is 16 32-bit words: sequence number,
+ * identifier, 12 payload words, a zero word and a checksum, the 32-bit sum
+ * of the first 15 words.
+ */
+static int
+isp_send_cmd(struct amdgpu_device *adev, uint32_t id, const uint32_t *payload,
+    int nwords)
+{
+	uint32_t e[ISP_ENTRY_SIZE / 4], rptr, wptr, sum;
+	uint8_t *ring;
+	int i;
+
+	if (nwords > 12)
+		return (EINVAL);
+	memset(e, 0, sizeof(e));
+	e[0] = ++isp_cmd_seq;
+	e[1] = id;
+	for (i = 0; i < nwords; i++)
+		e[2 + i] = payload[i];
+	for (sum = 0, i = 0; i < 15; i++)
+		sum += e[i];
+	e[15] = sum;
+
+	rptr = ISP_RD(adev, ISP_CMD_RPTR);
+	wptr = ISP_RD(adev, ISP_CMD_WPTR);
+	if ((wptr + ISP_ENTRY_SIZE) % ISP_RING_SIZE == rptr)
+		return (ENOSPC);
+	ring = (uint8_t *)isp_ring_cpu + ISP_CMD_SLOT * ISP_RING_SLOT;
+	memcpy(ring + wptr, e, sizeof(e));
+	wmb();
+	ISP_WR(adev, ISP_CMD_WPTR, (wptr + ISP_ENTRY_SIZE) % ISP_RING_SIZE);
+	printf("amdisp: sent cmd 0x%08x seq %u at ring offset 0x%x\n", id,
+	    e[0], wptr);
+	return (0);
+}
+
+/* Poll the response ring for up to timeout_ms, printing each response. */
+static int
+isp_poll_resp(struct amdgpu_device *adev, int timeout_ms)
+{
+	uint32_t e[ISP_ENTRY_SIZE / 4], rptr, wptr, st, sum;
+	uint8_t *ring;
+	int i, n, t;
+
+	ring = (uint8_t *)isp_ring_cpu + ISP_RESP_SLOT * ISP_RING_SLOT;
+	for (n = 0, t = 0; t < timeout_ms; t++) {
+		st = ISP_RD(adev, ISP_INT_STATUS);
+		if (st != 0) {
+			ISP_WR(adev, ISP_INT_ACK, st);
+			printf("amdisp: interrupt status 0x%x at %d ms\n", st,
+			    t);
+		}
+		rptr = ISP_RD(adev, ISP_RESP_RPTR);
+		wptr = ISP_RD(adev, ISP_RESP_WPTR);
+		while (rptr != wptr) {
+			rmb();
+			memcpy(e, ring + rptr, sizeof(e));
+			for (sum = 0, i = 0; i < 15; i++)
+				sum += e[i];
+			printf("amdisp: resp seq %u type 0x%08x w2 0x%x w3 0x%x "
+			    "w4 0x%x w5 0x%x checksum %s\n", e[0], e[1], e[2],
+			    e[3], e[4], e[5], sum == e[15] ? "ok" : "BAD");
+			rptr = (rptr + ISP_ENTRY_SIZE) % ISP_RING_SIZE;
+			ISP_WR(adev, ISP_RESP_RPTR, rptr);
+			n++;
+		}
+		if (n > 0)
+			return (0);
+		mdelay(1);
+	}
+	printf("amdisp: no response after %d ms (cmd rptr 0x%x wptr 0x%x)\n",
+	    timeout_ms, ISP_RD(adev, ISP_CMD_RPTR), ISP_RD(adev, ISP_CMD_WPTR));
+	return (ETIMEDOUT);
+}
+
+/* First command: give the firmware its working memory, as Linux does. */
+static int
+isp_send_pool(struct amdgpu_device *adev)
+{
+	uint32_t p[6];
+	int r;
+
+	if (isp_pool_bo == NULL) {
+		r = amdgpu_bo_create_kernel(adev, ISP_POOL_SIZE, PAGE_SIZE,
+		    AMDGPU_GEM_DOMAIN_GTT, &isp_pool_bo, &isp_pool_gpu,
+		    &isp_pool_cpu);
+		if (r != 0) {
+			printf("amdisp: pool allocation failed: %d\n", r);
+			return (r);
+		}
+	}
+	p[0] = ISP_BUF_TYPE_POOL;
+	p[1] = 0;
+	p[2] = 4;
+	p[3] = lower_32_bits(isp_pool_gpu);
+	p[4] = upper_32_bits(isp_pool_gpu);
+	p[5] = ISP_POOL_SIZE;
+	r = isp_send_cmd(adev, ISP_CMD_SEND_BUFFER, p, nitems(p));
+	if (r != 0)
+		return (r);
+	return (isp_poll_resp(adev, 500));
 }
 
 static int
@@ -146,6 +271,7 @@ isp_boot(struct amdgpu_device *adev)
 		return (ETIMEDOUT);
 	}
 	ISP_WR(adev, ISP_INT_ENABLE, 0x410000);
+	isp_cmd_seq = 0;
 	printf("amdisp: firmware booted\n");
 	return (0);
 }
@@ -184,6 +310,25 @@ isp_boot_sysctl(SYSCTL_HANDLER_ARGS)
 	}
 	return (error);
 }
+static int
+isp_cmd_sysctl(SYSCTL_HANDLER_ARGS)
+{
+	int error, val;
+
+	val = 0;
+	error = sysctl_handle_int(oidp, &val, 0, req);
+	if (error != 0 || req->newptr == NULL)
+		return (error);
+	if (isp_adev == NULL || !isp_booted)
+		return (ENXIO);
+	if (val == 1)
+		return (isp_send_pool(isp_adev));
+	return (EINVAL);
+}
+SYSCTL_PROC(_hw_amdgpu, OID_AUTO, isp_cmd,
+    CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_MPSAFE, NULL, 0, isp_cmd_sysctl, "I",
+    "ISP command test: 1 sends the memory pool and waits for the response");
+
 SYSCTL_PROC(_hw_amdgpu, OID_AUTO, isp_boot,
     CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_MPSAFE, NULL, 0, isp_boot_sysctl, "I",
     "ISP boot test: 1 boots the ISP firmware, 0 stops it");
