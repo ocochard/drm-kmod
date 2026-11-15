@@ -60,6 +60,9 @@ static int isp_hw_init(void *handle)
 	if (!ip_block)
 		return -EINVAL;
 
+#ifdef __FreeBSD__
+	amdgpu_isp_freebsd_attach(adev);
+#endif
 	if (isp->funcs->hw_init != NULL)
 		return isp->funcs->hw_init(isp);
 
@@ -77,6 +80,9 @@ static int isp_hw_fini(void *handle)
 	struct amdgpu_device *adev = (struct amdgpu_device *)handle;
 	struct amdgpu_isp *isp = &adev->isp;
 
+#ifdef __FreeBSD__
+	amdgpu_isp_freebsd_detach(adev);
+#endif
 	if (isp->funcs->hw_fini != NULL)
 		return isp->funcs->hw_fini(isp);
 

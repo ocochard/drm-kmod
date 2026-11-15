@@ -58,4 +58,9 @@ struct amdgpu_isp {
 extern const struct amdgpu_ip_block_version isp_v4_1_0_ip_block;
 extern const struct amdgpu_ip_block_version isp_v4_1_1_ip_block;
 
+#ifdef __FreeBSD__
+void amdgpu_isp_freebsd_attach(struct amdgpu_device *adev);
+void amdgpu_isp_freebsd_detach(struct amdgpu_device *adev);
+#endif
+
 #endif /* __AMDGPU_ISP_H__ */
