@@ -303,6 +303,40 @@ isp_dump_regs(const char *when)
 }
 
 /*
+ * Sample the ISP's first I2C controller (DesignWare, at 0x66400) every
+ * 100 us and print each change: target address (IC_TAR, +0x04), status
+ * (IC_STATUS, +0x70), raw interrupts (+0x34), TX/RX FIFO levels (+0x74,
+ * +0x78), abort source (+0x80); plus the first MIPI PHY register.
+ */
+static void
+isp_watch_i2c(int ms)
+{
+	static const uint32_t regs[] = { 0x66404, 0x66470, 0x66434, 0x66474,
+	    0x66478, 0x66480, 0x66700 };
+	uint32_t prev[nitems(regs)], v[nitems(regs)];
+	int i, t, changed, n;
+
+	memset(prev, 0xff, sizeof(prev));
+	for (n = 0, t = 0; t < ms * 10 && n < 300; t++) {
+		changed = 0;
+		for (i = 0; i < nitems(regs); i++)
+			v[i] = ISP_RD(regs[i]);
+		/* Report target, abort and PHY changes, and busy/idle edges. */
+		if (v[0] != prev[0] || v[5] != prev[5] || v[6] != prev[6] ||
+		    (v[1] & 0x20) != (prev[1] & 0x20))
+			changed = 1;
+		if (changed) {
+			printf("amdisp: i2c %4d.%d ms tar 0x%x st 0x%x raw 0x%x "
+			    "txfl %u rxfl %u abrt 0x%x phy 0x%x\n", t / 10,
+			    t % 10, v[0], v[1], v[2], v[3], v[4], v[5], v[6]);
+			memcpy(prev, v, sizeof(prev));
+			n++;
+		}
+		DELAY(100);
+	}
+}
+
+/*
  * Stream set-up as measured on Linux, then wait for one frame: stream
  * configuration, NV12 1920x1080 on the preview channel, eight meta info
  * buffers, four frame buffers, start.
@@ -328,8 +362,12 @@ isp_one_frame(void)
 	MDELAY(10);
 	if ((r = isp_send_pool()) != 0)
 		return (r);
-	if ((r = isp_cmd_wait(ISP_CMD_SET_STREAM_CONFIG, cfg,
-	    nitems(cfg))) != 0 ||
+	isp_watch_i2c(5);	/* state before any command */
+	if ((r = isp_send_cmd(ISP_CMD_SET_STREAM_CONFIG, cfg,
+	    nitems(cfg))) != 0)
+		return (r);
+	isp_watch_i2c(400);
+	if ((r = isp_poll_resp_type(500, ISP_RESP_CMD_DONE)) != 0 ||
 	    (r = isp_cmd_wait(ISP_CMD_SET_OUT_CHAN_PROP, prop,
 	    nitems(prop))) != 0 ||
 	    (r = isp_cmd_wait(ISP_CMD_ENABLE_OUT_CHAN, en,
@@ -372,8 +410,8 @@ isp_one_frame(void)
 	}
 	if ((r = isp_cmd_wait(ISP_CMD_START_STREAM, NULL, 0)) != 0)
 		return (r);
-	MDELAY(300);
-	isp_dump_regs("300 ms after START_STREAM");
+	isp_watch_i2c(1500);
+	isp_dump_regs("1.5 s after START_STREAM");
 	r = isp_poll_resp_type(2000, ISP_RESP_FRAME_DONE);
 
 	isp_cmd_wait(ISP_CMD_ENABLE_OUT_CHAN, dis, nitems(dis));
