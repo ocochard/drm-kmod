@@ -85,7 +85,7 @@
 
 #define	ISP_NMETA		8
 #define	ISP_META_SIZE		0x8000
-#define	ISP_NFRAME		4
+#define	ISP_NFRAME		8
 /*
  * Frame sizes the Linux driver offers (each at 30 fps, in NV12 and YUYV).
  * The firmware takes any of them in SET_OUT_CHAN_PROP; the line pitch is
@@ -610,10 +610,17 @@ isp_stream_setup(void)
 			p[7] = HI32(uv);
 			p[8] = ISP_Y_SIZE / 2;
 		}
+		/* Like Linux: half the frame buffers now, half after start. */
+		if (i >= ISP_NFRAME / 2)
+			continue;
 		if ((r = isp_cmd_wait(ISP_CMD_SEND_BUFFER, p, 9)) != 0)
 			return (r);
 	}
-	return (isp_cmd_wait(ISP_CMD_START_STREAM, NULL, 0));
+	if ((r = isp_cmd_wait(ISP_CMD_START_STREAM, NULL, 0)) != 0)
+		return (r);
+	for (i = ISP_NFRAME / 2; i < ISP_NFRAME; i++)
+		isp_requeue_buf(ISP_BUF_TYPE_FRAME, isp_frame_gpu[i], 0);
+	return (0);
 }
 
 /* Disable the preview channel and stop the stream. */
@@ -1102,7 +1109,7 @@ amdisp_start_stream(device_t dev)
 	 */
 	for (try = 0; try < 2; try++) {
 		isp_enable_gpio(0);
-		MDELAY(10);
+		MDELAY(25);	/* Linux: at least 20 ms between off and on */
 		isp_enable_gpio(1);
 		MDELAY(10);
 		isp_booted = 1;
