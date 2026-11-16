@@ -827,6 +827,36 @@ SYSCTL_PROC(_hw_amdisp, OID_AUTO, meta,
     CTLTYPE_OPAQUE | CTLFLAG_RD | CTLFLAG_MPSAFE, NULL, 0, isp_meta_sysctl,
     "", "Meta info of the last ISP frame (4 KB)");
 
+/* amdgpu's gpu_metrics table, the same bytes as Linux's sysfs gpu_metrics. */
+static int
+isp_metrics_sysctl(SYSCTL_HANDLER_ARGS)
+{
+	uint8_t buf[1024];
+	uint64_t features;
+	int size;
+
+	size = amdgpu_isp_fbsd_metrics(buf, sizeof(buf), &features);
+	if (size < 0)
+		return (-size);
+	return (SYSCTL_OUT(req, buf, size));
+}
+SYSCTL_PROC(_hw_amdisp, OID_AUTO, gpu_metrics,
+    CTLTYPE_OPAQUE | CTLFLAG_RD | CTLFLAG_MPSAFE, NULL, 0, isp_metrics_sysctl,
+    "", "amdgpu gpu_metrics table");
+
+static int
+isp_features_sysctl(SYSCTL_HANDLER_ARGS)
+{
+	uint8_t buf[1024];
+	uint64_t features = 0;
+
+	(void)amdgpu_isp_fbsd_metrics(buf, sizeof(buf), &features);
+	return (sysctl_handle_64(oidp, &features, 0, req));
+}
+SYSCTL_PROC(_hw_amdisp, OID_AUTO, smu_features,
+    CTLTYPE_U64 | CTLFLAG_RD | CTLFLAG_MPSAFE, NULL, 0, isp_features_sysctl,
+    "QU", "SMU enabled-feature mask");
+
 SYSCTL_PROC(_hw_amdisp, OID_AUTO, frame,
     CTLTYPE_OPAQUE | CTLFLAG_RD | CTLFLAG_MPSAFE, NULL, 0, isp_frame_sysctl,
     "", "Last ISP frame (NV12 1920x1080)");

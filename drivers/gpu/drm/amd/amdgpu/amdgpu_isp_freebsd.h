@@ -14,7 +14,7 @@
 
 #include <sys/types.h>
 
-#define	AMDGPU_ISP_FBSD_VERSION		2
+#define	AMDGPU_ISP_FBSD_VERSION		3
 
 /* SMU requests. */
 #define	AMDGPU_ISP_FBSD_POWER_UP	0	/* PowerUpIspByTile */
@@ -31,6 +31,13 @@ int		amdgpu_isp_fbsd_alloc(size_t size, void **handle,
 		    uint64_t *gpu, void **cpu);
 void		amdgpu_isp_fbsd_free(void **handle, uint64_t *gpu, void **cpu);
 int		amdgpu_isp_fbsd_smu(int req, uint32_t arg);
+/*
+ * Copy amdgpu's gpu_metrics table (what Linux shows in sysfs gpu_metrics)
+ * into buf and the SMU enabled-feature mask into *features.  Returns the
+ * bytes copied or a negative errno.
+ */
+int		amdgpu_isp_fbsd_metrics(void *buf, size_t len,
+		    uint64_t *features);
 /*
  * Called from amdgpu's interrupt handler for every ISP ring-buffer
  * interrupt (IH client ISP, sources WPT9-WPT16); NULL to stop.

@@ -86,6 +86,26 @@ amdgpu_isp_fbsd_smu(int req, uint32_t arg)
 	    msg[req], arg, NULL));
 }
 
+int
+amdgpu_isp_fbsd_metrics(void *buf, size_t len, uint64_t *features)
+{
+	void *table = NULL;
+	int size;
+
+	if (isp_adev == NULL)
+		return (-ENXIO);
+	if (smu_cmn_get_enabled_mask(isp_adev->powerplay.pp_handle,
+	    features) != 0)
+		*features = 0;
+	size = amdgpu_dpm_get_gpu_metrics(isp_adev, &table);
+	if (size <= 0 || table == NULL)
+		return (size < 0 ? size : -ENODATA);
+	if ((size_t)size > len)
+		size = len;
+	memcpy(buf, table, size);
+	return (size);
+}
+
 static void (*isp_intr_fn)(void *);
 static void *isp_intr_arg;
 static bool isp_intr_registered;
