@@ -235,6 +235,14 @@ iommu_sva_unbind_device(struct iommu_sva *handle)
 }
 
 /*
+ * Linux compiles print_hex_dump_debug() to nothing unless dynamic debug
+ * enables it; LinuxKPI prints it to the console, several lines per NPU
+ * command, which made each command take about 100 ms.
+ */
+#undef print_hex_dump_debug
+#define	print_hex_dump_debug(...)	do { } while (0)
+
+/*
  * drm_sched: amdxdna targets the Linux 7.x API, drm-kmod ships 6.12.
  */
 #define	DRM_GPU_SCHED_STAT_NO_HANG	DRM_GPU_SCHED_STAT_NOMINAL
