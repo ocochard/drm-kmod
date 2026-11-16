@@ -1039,21 +1039,31 @@ isp_enable_gpio(int on)
 static int
 amdisp_start_stream(device_t dev)
 {
-	int r;
+	int r, try;
 
 	if (isp_booted)
 		return (EBUSY);	/* the sysctl test owns the ISP */
-	isp_enable_gpio(0);
-	MDELAY(10);
-	isp_enable_gpio(1);
-	MDELAY(10);
-	isp_booted = 1;
-	if ((r = isp_boot()) != 0 || (r = isp_stream_setup()) != 0) {
+	/*
+	 * The first start after a boot sometimes gets no answer to
+	 * SET_STREAM_CONFIG; a full power cycle and a second try works.
+	 */
+	for (try = 0; try < 2; try++) {
+		isp_enable_gpio(0);
+		MDELAY(10);
+		isp_enable_gpio(1);
+		MDELAY(10);
+		isp_booted = 1;
+		if ((r = isp_boot()) == 0 && (r = isp_stream_setup()) == 0)
+			break;
 		isp_stop();
 		isp_booted = 0;
 		isp_enable_gpio(0);
-		return (r);
+		if (r != ETIMEDOUT)
+			return (r);
+		printf("amdisp: stream start timed out, retrying\n");
 	}
+	if (r != 0)
+		return (r);
 	isp_video_seq = 0;
 	isp_requeue = 1;
 	isp_streaming = 1;
