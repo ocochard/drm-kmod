@@ -79,6 +79,9 @@ void amdxdna_carveout_fini(struct amdxdna_dev *xdna)
 struct amdxdna_cbuf_priv {
 	struct amdxdna_dev *xdna;
 	struct drm_mm_node node;
+#ifdef __FreeBSD__
+	struct dma_buf *dbuf;
+#endif
 };
 
 static struct sg_table *amdxdna_cbuf_map(struct dma_buf_attachment *attach,
@@ -174,8 +177,32 @@ static vm_fault_t amdxdna_cbuf_vm_fault(struct vm_fault *vmf)
 	return vmf_insert_pfn(vma, vmf->address, pfn);
 }
 
+#ifdef __FreeBSD__
+/*
+ * LinuxKPI needs open and close.  The mapping holds a dma-buf reference,
+ * as the file reference taken by Linux dma_buf_mmap().
+ */
+static void amdxdna_cbuf_vm_open(struct vm_area_struct *vma)
+{
+	struct amdxdna_cbuf_priv *cbuf = vma->vm_private_data;
+
+	get_dma_buf(cbuf->dbuf);
+}
+
+static void amdxdna_cbuf_vm_close(struct vm_area_struct *vma)
+{
+	struct amdxdna_cbuf_priv *cbuf = vma->vm_private_data;
+
+	dma_buf_put(cbuf->dbuf);
+}
+#endif
+
 static const struct vm_operations_struct amdxdna_cbuf_vm_ops = {
 	.fault = amdxdna_cbuf_vm_fault,
+#ifdef __FreeBSD__
+	.open = amdxdna_cbuf_vm_open,
+	.close = amdxdna_cbuf_vm_close,
+#endif
 };
 
 static int amdxdna_cbuf_mmap(struct dma_buf *dbuf, struct vm_area_struct *vma)
@@ -184,6 +211,9 @@ static int amdxdna_cbuf_mmap(struct dma_buf *dbuf, struct vm_area_struct *vma)
 
 	vma->vm_ops = &amdxdna_cbuf_vm_ops;
 	vma->vm_private_data = cbuf;
+#ifdef __FreeBSD__
+	get_dma_buf(dbuf);
+#endif
 	vm_flags_set(vma, VM_PFNMAP | VM_DONTEXPAND | VM_DONTDUMP);
 
 	return 0;
@@ -263,6 +293,9 @@ struct dma_buf *amdxdna_get_cbuf(struct drm_device *dev, size_t size, u64 alignm
 		ret = PTR_ERR(dbuf);
 		goto remove_node;
 	}
+#ifdef __FreeBSD__
+	cbuf->dbuf = dbuf;
+#endif
 
 	ret = amdxdna_cbuf_clear(dbuf);
 	if (ret) {

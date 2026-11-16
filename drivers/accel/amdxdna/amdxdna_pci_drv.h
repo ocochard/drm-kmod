@@ -114,6 +114,11 @@ struct amdxdna_carveout;
 
 struct amdxdna_dev {
 	struct drm_device		ddev;
+#ifdef __FreeBSD__
+	struct cdev			*accel_alias;	/* /dev/accel/accelN */
+	struct vm_page			*carveout_pages;
+	unsigned long			carveout_npages;
+#endif
 	struct amdxdna_dev_hdl		*dev_handle;
 	const struct amdxdna_dev_info	*dev_info;
 	void				*xrs_hdl;

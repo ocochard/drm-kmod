@@ -5,12 +5,14 @@
 
 #include <drm/amdxdna_accel.h>
 #include <drm/drm_managed.h>
+#include <drm/drm_prime.h>
 #include <linux/iommu.h>
 #include <linux/iova.h>
 
 #include "amdxdna_gem.h"
 #include "amdxdna_pci_drv.h"
 
+#ifdef __linux__
 static bool force_iova;
 module_param(force_iova, bool, 0600);
 MODULE_PARM_DESC(force_iova, "Force use IOVA (Default false)");
@@ -223,3 +225,60 @@ put_group:
 
 	return ret;
 }
+#else	/* !__linux__ */
+/*
+ * FreeBSD: no IOMMU paging domain or IOVA allocator in LinuxKPI.
+ * Run without IOMMU translation; buffers use physical addresses
+ * (carveout).
+ */
+int amdxdna_dma_map_bo(struct amdxdna_dev *xdna, struct amdxdna_gem_obj *abo)
+{
+	unsigned long contig_sz;
+	struct sg_table *sgt;
+
+	if (abo->type != AMDXDNA_BO_DEV_HEAP && abo->type != AMDXDNA_BO_SHARE)
+		return 0;
+
+	sgt = drm_gem_shmem_get_pages_sgt(&abo->base);
+	if (IS_ERR(sgt)) {
+		XDNA_ERR(xdna, "Get sgt failed, ret %ld", PTR_ERR(sgt));
+		return PTR_ERR(sgt);
+	}
+
+	/* No IOMMU: the NPU needs one physically contiguous range. */
+	contig_sz = drm_prime_get_contiguous_size(sgt);
+	if (contig_sz < abo->mem.size) {
+		XDNA_ERR(xdna, "noncontiguous dma addr, contig size:%ld, expected size:%ld",
+			 contig_sz, abo->mem.size);
+		return -EINVAL;
+	}
+	abo->mem.dma_addr = sg_dma_address(sgt->sgl);
+	return 0;
+}
+
+void amdxdna_dma_unmap_bo(struct amdxdna_dev *xdna, struct amdxdna_gem_obj *abo)
+{
+	abo->mem.dma_addr = AMDXDNA_INVALID_ADDR;
+}
+
+void *amdxdna_iommu_alloc(struct amdxdna_dev *xdna, size_t size, dma_addr_t *dma_addr)
+{
+	return ERR_PTR(-EOPNOTSUPP);
+}
+
+void amdxdna_iommu_free(struct amdxdna_dev *xdna, size_t size,
+			void *cpu_addr, dma_addr_t dma_addr)
+{
+}
+
+void amdxdna_iommu_fini(struct amdxdna_dev *xdna)
+{
+}
+
+int amdxdna_iommu_init(struct amdxdna_dev *xdna)
+{
+	xdna->group = NULL;
+	xdna->domain = NULL;
+	return 0;
+}
+#endif	/* __linux__ */

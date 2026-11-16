@@ -112,7 +112,12 @@ static const struct {
 
 void amdxdna_debugfs_init(struct amdxdna_dev *xdna)
 {
-	struct drm_minor *minor = xdna->ddev.accel;
+#ifdef __linux__
+	struct dentry *root = xdna->ddev.accel->debugfs_root;
+#else
+	/* XXX FreeBSD: no accel minor; use the device directory. */
+	struct dentry *root = xdna->ddev.debugfs_root;
+#endif
 	int i;
 
 	/*
@@ -122,7 +127,7 @@ void amdxdna_debugfs_init(struct amdxdna_dev *xdna)
 	for (i = 0; i < ARRAY_SIZE(amdxdna_dbgfs_files); i++) {
 		debugfs_create_file(amdxdna_dbgfs_files[i].name,
 				    amdxdna_dbgfs_files[i].mode,
-				    minor->debugfs_root,
+				    root,
 				    xdna,
 				    amdxdna_dbgfs_files[i].fops);
 	}

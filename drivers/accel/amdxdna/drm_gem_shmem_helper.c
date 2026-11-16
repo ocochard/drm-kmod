@@ -97,8 +97,10 @@ __drm_gem_shmem_create(struct drm_device *dev, size_t size, bool private)
 		 * why this is required _and_ expected if you're
 		 * going to pin these pages.
 		 */
+#ifdef __linux__
 		mapping_set_gfp_mask(obj->filp->f_mapping, GFP_HIGHUSER |
 				     __GFP_RETRY_MAYFAIL | __GFP_NOWARN);
+#endif
 	}
 
 	return shmem;
@@ -458,7 +460,9 @@ void drm_gem_shmem_purge(struct drm_gem_shmem_object *shmem)
 
 	shmem->madv = -1;
 
+#ifdef __linux__
 	drm_vma_node_unmap(&obj->vma_node, dev->anon_inode->i_mapping);
+#endif
 	drm_gem_free_mmap_offset(obj);
 
 	/* Our goal here is to return as much of the memory as
@@ -466,9 +470,13 @@ void drm_gem_shmem_purge(struct drm_gem_shmem_object *shmem)
 	 * To do this we must instruct the shmfs to drop all of its
 	 * backing pages, *now*.
 	 */
+#ifdef __linux__
 	shmem_truncate_range(file_inode(obj->filp), 0, (loff_t)-1);
 
 	invalidate_mapping_pages(file_inode(obj->filp)->i_mapping, 0, (loff_t)-1);
+#else
+	shmem_truncate_range(obj->filp->f_shmem, 0, (loff_t)-1);
+#endif
 }
 EXPORT_SYMBOL(drm_gem_shmem_purge);
 

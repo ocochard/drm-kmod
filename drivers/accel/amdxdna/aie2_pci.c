@@ -492,8 +492,17 @@ static int aie2_init(struct amdxdna_dev *xdna)
 	}
 
 	if (!xdna->group) {
+#ifdef __linux__
 		XDNA_ERR(xdna, "Running without IOMMU not supported");
 		return -EINVAL;
+#else
+		/*
+		 * XXX FreeBSD: LinuxKPI has no IOMMU groups.  Linux blocks
+		 * this case because s2idle then fails to reach hardware
+		 * sleep; run anyway, with physical addresses (carveout).
+		 */
+		XDNA_WARN(xdna, "Running without IOMMU, carveout memory only");
+#endif
 	}
 
 	ndev = drmm_kzalloc(&xdna->ddev, sizeof(*ndev), GFP_KERNEL);
@@ -556,6 +565,24 @@ static int aie2_init(struct amdxdna_dev *xdna)
 		goto release_fw;
 	}
 
+#ifdef __FreeBSD__
+	/* FreeBSD pci_alloc_msix() needs the table and PBA BARs active. */
+	for (i = 0; i < 2; i++) {
+		int rid, bar;
+
+		rid = i == 0 ? pci_msix_table_bar(pdev->dev.bsddev) :
+		    pci_msix_pba_bar(pdev->dev.bsddev);
+		if (rid < 0)
+			continue;
+		bar = (rid - PCIR_BAR(0)) / 4;
+		if (bar < PCI_NUM_RESOURCES && !tbl[bar] &&
+		    !(tbl[bar] = pcim_iomap(pdev, bar, 0))) {
+			XDNA_ERR(xdna, "map MSI-X bar %d failed", bar);
+			ret = -ENOMEM;
+			goto release_fw;
+		}
+	}
+#endif
 	nvec = pci_msix_vec_count(pdev);
 	if (nvec <= 0) {
 		XDNA_ERR(xdna, "does not get number of interrupt vector");

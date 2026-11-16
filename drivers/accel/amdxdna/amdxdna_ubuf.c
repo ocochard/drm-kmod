@@ -14,6 +14,8 @@
 #include "amdxdna_pci_drv.h"
 #include "amdxdna_ubuf.h"
 
+#ifdef __linux__
+
 struct amdxdna_ubuf_priv {
 	struct page **pages;
 	u64 nr_pages;
@@ -185,3 +187,11 @@ free_ubuf:
 	kfree(ubuf);
 	return ERR_PTR(ret);
 }
+#else	/* !__linux__ */
+/* XXX FreeBSD: no pin_user_pages_fast() with FOLL_LONGTERM; no userptr BOs. */
+struct dma_buf *amdxdna_get_ubuf(struct drm_device *dev,
+				 u32 num_entries, void __user *va_entries)
+{
+	return ERR_PTR(-EOPNOTSUPP);
+}
+#endif	/* __linux__ */

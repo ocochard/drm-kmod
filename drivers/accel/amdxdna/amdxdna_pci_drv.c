@@ -119,7 +119,11 @@ static int amdxdna_drm_open(struct drm_device *ddev, struct drm_file *filp)
 	if (ret)
 		goto free_client;
 
+#ifdef __linux__
 	client->pid = pid_nr(rcu_access_pointer(filp->pid));
+#else
+	client->pid = filp->pid;
+#endif
 	client->xdna = xdna;
 	client->pasid = IOMMU_PASID_INVALID;
 	client->mm = current->mm;
@@ -263,22 +267,29 @@ static int amdxdna_drm_gem_mmap(struct file *filp, struct vm_area_struct *vma)
 	return xdna->dev_info->ops->mmap(client, vma);
 }
 
+#ifdef __linux__
+#define AMDXDNA_IOCTL_FLAGS	0
+#else
+/* XXX FreeBSD: served from a render node, which needs DRM_RENDER_ALLOW. */
+#define AMDXDNA_IOCTL_FLAGS	DRM_RENDER_ALLOW
+#endif
+
 static const struct drm_ioctl_desc amdxdna_drm_ioctls[] = {
 	/* Context */
-	DRM_IOCTL_DEF_DRV(AMDXDNA_CREATE_HWCTX, amdxdna_drm_create_hwctx_ioctl, 0),
-	DRM_IOCTL_DEF_DRV(AMDXDNA_DESTROY_HWCTX, amdxdna_drm_destroy_hwctx_ioctl, 0),
-	DRM_IOCTL_DEF_DRV(AMDXDNA_CONFIG_HWCTX, amdxdna_drm_config_hwctx_ioctl, 0),
+	DRM_IOCTL_DEF_DRV(AMDXDNA_CREATE_HWCTX, amdxdna_drm_create_hwctx_ioctl, AMDXDNA_IOCTL_FLAGS),
+	DRM_IOCTL_DEF_DRV(AMDXDNA_DESTROY_HWCTX, amdxdna_drm_destroy_hwctx_ioctl, AMDXDNA_IOCTL_FLAGS),
+	DRM_IOCTL_DEF_DRV(AMDXDNA_CONFIG_HWCTX, amdxdna_drm_config_hwctx_ioctl, AMDXDNA_IOCTL_FLAGS),
 	/* BO */
-	DRM_IOCTL_DEF_DRV(AMDXDNA_CREATE_BO, amdxdna_drm_create_bo_ioctl, 0),
-	DRM_IOCTL_DEF_DRV(AMDXDNA_GET_BO_INFO, amdxdna_drm_get_bo_info_ioctl, 0),
-	DRM_IOCTL_DEF_DRV(AMDXDNA_SYNC_BO, amdxdna_drm_sync_bo_ioctl, 0),
+	DRM_IOCTL_DEF_DRV(AMDXDNA_CREATE_BO, amdxdna_drm_create_bo_ioctl, AMDXDNA_IOCTL_FLAGS),
+	DRM_IOCTL_DEF_DRV(AMDXDNA_GET_BO_INFO, amdxdna_drm_get_bo_info_ioctl, AMDXDNA_IOCTL_FLAGS),
+	DRM_IOCTL_DEF_DRV(AMDXDNA_SYNC_BO, amdxdna_drm_sync_bo_ioctl, AMDXDNA_IOCTL_FLAGS),
 	/* Execution */
-	DRM_IOCTL_DEF_DRV(AMDXDNA_EXEC_CMD, amdxdna_drm_submit_cmd_ioctl, 0),
-	DRM_IOCTL_DEF_DRV(AMDXDNA_WAIT_CMD, amdxdna_drm_wait_cmd_ioctl, 0),
+	DRM_IOCTL_DEF_DRV(AMDXDNA_EXEC_CMD, amdxdna_drm_submit_cmd_ioctl, AMDXDNA_IOCTL_FLAGS),
+	DRM_IOCTL_DEF_DRV(AMDXDNA_WAIT_CMD, amdxdna_drm_wait_cmd_ioctl, AMDXDNA_IOCTL_FLAGS),
 	/* AIE hardware */
-	DRM_IOCTL_DEF_DRV(AMDXDNA_GET_INFO, amdxdna_drm_get_info_ioctl, 0),
-	DRM_IOCTL_DEF_DRV(AMDXDNA_GET_ARRAY, amdxdna_drm_get_array_ioctl, 0),
-	DRM_IOCTL_DEF_DRV(AMDXDNA_SET_STATE, amdxdna_drm_set_state_ioctl, DRM_ROOT_ONLY),
+	DRM_IOCTL_DEF_DRV(AMDXDNA_GET_INFO, amdxdna_drm_get_info_ioctl, AMDXDNA_IOCTL_FLAGS),
+	DRM_IOCTL_DEF_DRV(AMDXDNA_GET_ARRAY, amdxdna_drm_get_array_ioctl, AMDXDNA_IOCTL_FLAGS),
+	DRM_IOCTL_DEF_DRV(AMDXDNA_SET_STATE, amdxdna_drm_set_state_ioctl, DRM_ROOT_ONLY | AMDXDNA_IOCTL_FLAGS),
 };
 
 static void amdxdna_show_fdinfo(struct drm_printer *p, struct drm_file *filp)
@@ -314,7 +325,11 @@ static void amdxdna_show_fdinfo(struct drm_printer *p, struct drm_file *filp)
 
 static const struct file_operations amdxdna_fops = {
 	.owner		= THIS_MODULE,
+#ifdef __linux__
 	.open		= accel_open,
+#else
+	.open		= drm_open,
+#endif
 	.release	= drm_release,
 	.unlocked_ioctl	= drm_ioctl,
 	.compat_ioctl	= drm_compat_ioctl,
@@ -327,8 +342,17 @@ static const struct file_operations amdxdna_fops = {
 };
 
 const struct drm_driver amdxdna_drm_drv = {
+#ifdef __linux__
 	.driver_features = DRIVER_GEM | DRIVER_COMPUTE_ACCEL |
 		DRIVER_SYNCOBJ | DRIVER_SYNCOBJ_TIMELINE,
+#else
+	/*
+	 * XXX FreeBSD: drm-kmod has no accel minors yet; expose the NPU
+	 * through a render node and alias it as /dev/accel/accel0.
+	 */
+	.driver_features = DRIVER_GEM | DRIVER_RENDER |
+		DRIVER_SYNCOBJ | DRIVER_SYNCOBJ_TIMELINE,
+#endif
 	.fops = &amdxdna_fops,
 	.name = "amdxdna_accel_driver",
 	.desc = "AMD XDNA DRM implementation",
@@ -361,6 +385,9 @@ static void amdxdna_xdna_drm_release(struct drm_device *drm, void *res)
 	struct amdxdna_dev *xdna = res;
 
 	amdxdna_carveout_fini(xdna);
+#ifdef __FreeBSD__
+	amdxdna_freebsd_carveout_fini(xdna);
+#endif
 }
 
 static int amdxdna_probe(struct pci_dev *pdev, const struct pci_device_id *id)
@@ -405,6 +432,12 @@ static int amdxdna_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 	if (ret)
 		return ret;
 
+#ifdef __FreeBSD__
+	ret = amdxdna_freebsd_carveout_init(xdna);
+	if (ret)
+		goto iommu_fini;
+#endif
+
 	xdna->notifier_wq = drmm_alloc_ordered_workqueue(ddev, "notifier_wq", WQ_MEM_RECLAIM);
 	if (IS_ERR(xdna->notifier_wq)) {
 		ret = PTR_ERR(xdna->notifier_wq);
@@ -431,6 +464,13 @@ static int amdxdna_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 		goto failed_sysfs_fini;
 	}
 
+#ifdef __FreeBSD__
+	/* XRT opens /dev/accel/accelN; alias it to the render node. */
+	if (make_dev_alias_p(MAKEDEV_CHECKNAME | MAKEDEV_WAITOK,
+	    &xdna->accel_alias, ddev->render->bsd_device, "accel/accel%d",
+	    device_get_unit(pdev->dev.bsddev)) != 0)
+		XDNA_WARN(xdna, "Cannot create /dev/accel alias");
+#endif
 	amdxdna_debugfs_init(xdna);
 	return 0;
 
@@ -450,6 +490,10 @@ static void amdxdna_remove(struct pci_dev *pdev)
 	struct amdxdna_dev *xdna = pci_get_drvdata(pdev);
 	struct amdxdna_client *client;
 
+#ifdef __FreeBSD__
+	if (xdna->accel_alias != NULL)
+		destroy_dev(xdna->accel_alias);
+#endif
 	drm_dev_unplug(&xdna->ddev);
 	amdxdna_sysfs_fini(xdna);
 
@@ -489,12 +533,41 @@ static struct pci_driver amdxdna_pci_driver = {
 	.probe = amdxdna_probe,
 	.remove = amdxdna_remove,
 	.driver.pm = &amdxdna_pm_ops,
+#ifdef __linux__
 	.sriov_configure = amdxdna_sriov_configure,
+#endif
 };
 
+#ifdef __linux__
 module_pci_driver(amdxdna_pci_driver);
+#else
+SYSCTL_NODE(_hw, OID_AUTO, amdxdna, CTLFLAG_RW | CTLFLAG_MPSAFE, 0,
+    "amdxdna parameters");
+
+static int __init amdxdna_init(void)
+{
+	return pci_register_driver(&amdxdna_pci_driver);
+}
+
+static void __exit amdxdna_exit(void)
+{
+	pci_unregister_driver(&amdxdna_pci_driver);
+}
+
+LKPI_DRIVER_MODULE(amdxdna, amdxdna_init, amdxdna_exit);
+LKPI_PNP_INFO(pci, amdxdna, pci_ids);
+MODULE_DEPEND(amdxdna, drmn, 2, 2, 2);
+MODULE_DEPEND(amdxdna, linuxkpi, 1, 1, 1);
+MODULE_DEPEND(amdxdna, dmabuf, 1, 1, 1);
+MODULE_DEPEND(amdxdna, firmware, 1, 1, 1);
+#ifdef CONFIG_DEBUG_FS
+MODULE_DEPEND(amdxdna, lindebugfs, 1, 1, 1);
+#endif
+#endif
 
 MODULE_LICENSE("GPL");
+#ifdef __linux__
 MODULE_IMPORT_NS("AMD_PMF");
+#endif
 MODULE_AUTHOR("XRT Team <runtimeca39d@amd.com>");
 MODULE_DESCRIPTION("amdxdna driver");

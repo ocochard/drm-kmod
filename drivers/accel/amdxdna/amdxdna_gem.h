@@ -78,10 +78,15 @@ static inline void amdxdna_gem_put_obj(struct amdxdna_gem_obj *abo)
  * Obtain the user virtual address for accessing the BO.
  * It can be used for device to access the BO when PASID is enabled.
  */
+#ifdef __linux__
 static inline u64 amdxdna_gem_uva(struct amdxdna_gem_obj *abo)
 {
 	return abo->mem.uva;
 }
+#else
+u64 amdxdna_freebsd_gem_uva(struct amdxdna_gem_obj *abo);
+#define amdxdna_gem_uva(abo)	amdxdna_freebsd_gem_uva(abo)
+#endif
 
 void *amdxdna_gem_vmap(struct amdxdna_gem_obj *abo);
 u64 amdxdna_gem_dev_addr(struct amdxdna_gem_obj *abo);
