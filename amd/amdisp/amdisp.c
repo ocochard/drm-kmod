@@ -103,6 +103,7 @@ static void *isp_meta_bo[ISP_NMETA], *isp_frame_bo[ISP_NFRAME];
 static uint64_t isp_meta_gpu[ISP_NMETA], isp_frame_gpu[ISP_NFRAME];
 static void *isp_meta_cpu[ISP_NMETA], *isp_frame_cpu[ISP_NFRAME];
 static int isp_last_frame = -1;
+static int isp_nframes, isp_requeue;
 
 static SYSCTL_NODE(_hw, OID_AUTO, amdisp, CTLFLAG_RW | CTLFLAG_MPSAFE, 0,
     "AMD ISP 4.1 camera test");
@@ -175,8 +176,9 @@ isp_send_cmd(uint32_t id, const uint32_t *payload,
 	memcpy(ring + wptr, e, sizeof(e));
 	wmb();
 	ISP_WR(ISP_CMD_WPTR, (wptr + ISP_ENTRY_SIZE) % ISP_RING_SIZE);
-	printf("amdisp: sent cmd 0x%08x seq %u at ring offset 0x%x\n", id,
-	    e[0], wptr);
+	if (!isp_requeue)
+		printf("amdisp: sent cmd 0x%08x seq %u at ring offset 0x%x\n",
+		    id, e[0], wptr);
 	return (0);
 }
 
@@ -196,7 +198,8 @@ isp_poll_resp_type(int timeout_ms, uint32_t want)
 		st = ISP_RD(ISP_INT_STATUS);
 		if (st != 0) {
 			ISP_WR(ISP_INT_ACK, st);
-			printf("amdisp: interrupt status 0x%x at %d ms\n", st,
+			if (!isp_requeue)
+				printf("amdisp: interrupt status 0x%x at %d ms\n", st,
 			    t);
 		}
 		rptr = ISP_RD(ISP_RESP_RPTR);
@@ -206,6 +209,7 @@ isp_poll_resp_type(int timeout_ms, uint32_t want)
 			memcpy(e, ring + rptr, sizeof(e));
 			for (sum = 0, i = 0; i < 15; i++)
 				sum += e[i];
+			if (!isp_requeue)
 			printf("amdisp: resp seq %u type 0x%08x w2 0x%x w3 0x%x "
 			    "w4 0x%x w5 0x%x checksum %s at %d ms\n", e[0], e[1],
 			    e[2], e[3], e[4], e[5], sum == e[15] ? "ok" : "BAD",
@@ -241,8 +245,33 @@ isp_cmd_wait(uint32_t id, const uint32_t *p,
 
 	r = isp_send_cmd(id, p, n);
 	if (r == 0)
-		r = isp_poll_resp_type(500, ISP_RESP_CMD_DONE);
+		r = isp_poll_resp_type(2000, ISP_RESP_CMD_DONE);
 	return (r);
+}
+
+/* Give a meta info or frame buffer back to the firmware (no wait). */
+static void
+isp_requeue_buf(uint32_t type, uint64_t gpu, uint32_t size)
+{
+	uint32_t p[9];
+	uint64_t uv;
+
+	memset(p, 0, sizeof(p));
+	p[0] = type;
+	p[2] = 4;
+	p[3] = LO32(gpu);
+	p[4] = HI32(gpu);
+	if (type == ISP_BUF_TYPE_FRAME) {
+		uv = gpu + ISP_Y_SIZE;
+		p[5] = ISP_Y_SIZE;
+		p[6] = LO32(uv);
+		p[7] = HI32(uv);
+		p[8] = ISP_Y_SIZE / 2;
+		isp_send_cmd(ISP_CMD_SEND_BUFFER, p, 9);
+	} else {
+		p[5] = size;
+		isp_send_cmd(ISP_CMD_SEND_BUFFER, p, 6);
+	}
 }
 
 /* A finished frame: the meta info tells which frame buffer it is. */
@@ -253,7 +282,7 @@ isp_frame_done(uint64_t meta_gpu)
 	uint64_t y;
 	uint8_t *f;
 	uint64_t sum;
-	int i, j;
+	int i, j, k;
 
 	for (i = 0; i < ISP_NMETA; i++)
 		if (isp_meta_gpu[i] == meta_gpu)
@@ -264,6 +293,7 @@ isp_frame_done(uint64_t meta_gpu)
 		return;
 	}
 	m = isp_meta_cpu[i];
+	isp_nframes++;
 	status = m[0x14 / 4];
 	w = m[0x34 / 4];
 	h = m[0x38 / 4];
@@ -271,16 +301,26 @@ isp_frame_done(uint64_t meta_gpu)
 	for (j = 0; j < ISP_NFRAME; j++)
 		if (isp_frame_gpu[j] == y)
 			break;
-	printf("amdisp: meta %d: frame %u status %u %ux%u Y 0x%llx -> buffer %d\n",
-	    i, m[0], status, w, h, (unsigned long long)y, j);
-	if (j == ISP_NFRAME)
+	if (j == ISP_NFRAME) {
+		/* Meta info came back without a frame (no buffer queued). */
+		if (isp_requeue)
+			isp_requeue_buf(ISP_BUF_TYPE_META, isp_meta_gpu[i],
+			    ISP_META_SIZE);
 		return;
+	}
 	f = isp_frame_cpu[j];
-	for (sum = 0, i = 0; i < ISP_Y_SIZE; i += 4093)
-		sum += f[i];
-	printf("amdisp: buffer %d mean Y %llu\n", j,
-	    (unsigned long long)(sum / (ISP_Y_SIZE / 4093 + 1)));
+	for (sum = 0, k = 0; k < ISP_Y_SIZE; k += 4093)
+		sum += f[k];
+	if (isp_nframes <= 4 || isp_nframes % 10 == 0)
+		printf("amdisp: frame %u status %u %ux%u buffer %d mean Y "
+		    "%llu\n", m[0], status, w, h, j,
+		    (unsigned long long)(sum / (ISP_Y_SIZE / 4093 + 1)));
 	isp_last_frame = j;
+	if (isp_requeue) {
+		isp_requeue_buf(ISP_BUF_TYPE_META, isp_meta_gpu[i],
+		    ISP_META_SIZE);
+		isp_requeue_buf(ISP_BUF_TYPE_FRAME, isp_frame_gpu[j], 0);
+	}
 }
 
 /* Print the non-zero ISP control, GPIO, I2C and PHY registers. */
@@ -415,8 +455,7 @@ isp_one_frame(void)
 	if ((r = isp_send_cmd(ISP_CMD_SET_STREAM_CONFIG, cfg,
 	    nitems(cfg))) != 0)
 		return (r);
-	isp_watch_fast(200);
-	if ((r = isp_poll_resp_type(500, ISP_RESP_CMD_DONE)) != 0 ||
+	if ((r = isp_poll_resp_type(2000, ISP_RESP_CMD_DONE)) != 0 ||
 	    (r = isp_cmd_wait(ISP_CMD_SET_OUT_CHAN_PROP, prop,
 	    nitems(prop))) != 0 ||
 	    (r = isp_cmd_wait(ISP_CMD_ENABLE_OUT_CHAN, en,
@@ -461,7 +500,14 @@ isp_one_frame(void)
 		return (r);
 	isp_watch_i2c(1500);
 	isp_dump_regs("1.5 s after START_STREAM");
-	r = isp_poll_resp_type(2000, ISP_RESP_FRAME_DONE);
+	/* Stream 90 frames (3 s), giving each buffer back as it completes. */
+	isp_nframes = 0;
+	isp_requeue = 1;
+	for (i = 0; i < 200 && isp_nframes < 90; i++)
+		if ((r = isp_poll_resp_type(2000, ISP_RESP_FRAME_DONE)) != 0)
+			break;
+	isp_requeue = 0;
+	printf("amdisp: %d frames\n", isp_nframes);
 
 	isp_cmd_wait(ISP_CMD_ENABLE_OUT_CHAN, dis, nitems(dis));
 	isp_cmd_wait(ISP_CMD_STOP_STREAM, NULL, 0);
