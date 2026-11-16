@@ -86,12 +86,25 @@
 #define	ISP_NMETA		8
 #define	ISP_META_SIZE		0x8000
 #define	ISP_NFRAME		4
-#define	ISP_WIDTH		1920
-#define	ISP_HEIGHT		1080
-#define	ISP_Y_SIZE		(ISP_WIDTH * ISP_HEIGHT)
+/*
+ * Frame sizes the Linux driver offers (each at 30 fps, in NV12 and YUYV).
+ * The firmware takes any of them in SET_OUT_CHAN_PROP; the line pitch is
+ * the width (NV12) or twice the width (YUYV).
+ */
+static const struct {
+	uint32_t	w, h;
+} isp_sizes[] = {
+	{ 640, 360 }, { 640, 480 }, { 1280, 720 }, { 1280, 960 },
+	{ 1920, 1080 }, { 1920, 1440 }, { 2560, 1440 }, { 2880, 1620 },
+	{ 2880, 1624 }, { 2888, 1808 },
+};
+static uint32_t isp_w = 1920, isp_h = 1080;	/* current size */
+#define	ISP_WIDTH		isp_w
+#define	ISP_HEIGHT		isp_h
+#define	ISP_Y_SIZE		(isp_w * isp_h)
 #define	ISP_FRAME_SIZE		(ISP_Y_SIZE * 3 / 2)	/* NV12 */
 #define	ISP_YUYV_SIZE		(ISP_Y_SIZE * 2)	/* YUYV, one plane */
-#define	ISP_FRAME_ALLOC		ISP_YUYV_SIZE		/* fits both formats */
+#define	ISP_FRAME_ALLOC		(2888 * 1808 * 2)	/* largest size, YUYV */
 /* Firmware image formats (SET_OUT_CHAN_PROP word 1). */
 #define	ISP_FW_FMT_NV12		1
 #define	ISP_FW_FMT_YUYV		7	/* YUV 4:2:2 interleaved */
@@ -835,14 +848,15 @@ isp_poll_thread(void *arg __unused)
 }
 
 static void
-amdisp_fill_format(struct video_format *fmt, int yuyv)
+amdisp_fill_format(struct video_format *fmt, int yuyv, uint32_t w,
+    uint32_t h)
 {
 	memset(fmt, 0, sizeof(*fmt));
 	fmt->pixelformat = yuyv ? ISP_FOURCC_YUYV : ISP_FOURCC_NV12;
-	fmt->width = ISP_WIDTH;
-	fmt->height = ISP_HEIGHT;
-	fmt->bytesperline = yuyv ? ISP_WIDTH * 2 : ISP_WIDTH;
-	fmt->sizeimage = yuyv ? ISP_YUYV_SIZE : ISP_FRAME_SIZE;
+	fmt->width = w;
+	fmt->height = h;
+	fmt->bytesperline = yuyv ? w * 2 : w;
+	fmt->sizeimage = yuyv ? w * h * 2 : w * h * 3 / 2;
 	fmt->field = 1;		/* V4L2_FIELD_NONE */
 	fmt->colorspace = 8;	/* V4L2_COLORSPACE_SRGB */
 	strlcpy(fmt->description, yuyv ? "YUYV 4:2:2" : "Y/UV 4:2:0",
@@ -867,43 +881,76 @@ amdisp_enum_format(device_t dev, uint32_t index, struct video_format *fmt)
 {
 	if (index > 1)
 		return (EINVAL);
-	amdisp_fill_format(fmt, index == 1);
+	amdisp_fill_format(fmt, index == 1, isp_w, isp_h);
 	return (0);
 }
 
 static int
 amdisp_get_format(device_t dev, struct video_format *fmt)
 {
-	amdisp_fill_format(fmt, isp_yuyv);
+	amdisp_fill_format(fmt, isp_yuyv, isp_w, isp_h);
 	return (0);
+}
+
+/* The supported size closest to w x h (smallest difference in area). */
+static int
+amdisp_closest_size(uint32_t w, uint32_t h)
+{
+	uint64_t best, d, a;
+	int i, b;
+
+	a = (uint64_t)w * h;
+	best = UINT64_MAX;
+	b = 4;		/* 1920x1080 */
+	for (i = 0; i < nitems(isp_sizes); i++) {
+		if (isp_sizes[i].w == w && isp_sizes[i].h == h)
+			return (i);
+		d = (uint64_t)isp_sizes[i].w * isp_sizes[i].h;
+		d = d > a ? d - a : a - d;
+		if (d < best) {
+			best = d;
+			b = i;
+		}
+	}
+	return (b);
 }
 
 /* Any request gets the closest supported mode: YUYV if asked, else NV12. */
 static int
 amdisp_try_format(device_t dev, struct video_format *fmt)
 {
-	amdisp_fill_format(fmt, fmt->pixelformat == ISP_FOURCC_YUYV);
+	int i;
+
+	i = amdisp_closest_size(fmt->width, fmt->height);
+	amdisp_fill_format(fmt, fmt->pixelformat == ISP_FOURCC_YUYV,
+	    isp_sizes[i].w, isp_sizes[i].h);
 	return (0);
 }
 
 static int
 amdisp_set_format(device_t dev, const struct video_format *fmt)
 {
+	int i;
+
 	if (isp_streaming)
 		return (EBUSY);
+	i = amdisp_closest_size(fmt->width, fmt->height);
 	isp_yuyv = (fmt->pixelformat == ISP_FOURCC_YUYV);
+	isp_w = isp_sizes[i].w;
+	isp_h = isp_sizes[i].h;
 	return (0);
 }
 
 static int
 amdisp_enum_framesizes(device_t dev, struct video_frmsizeenum *fs)
 {
-	if (fs->index != 0 || (fs->pixelformat != ISP_FOURCC_NV12 &&
+	if (fs->index >= nitems(isp_sizes) ||
+	    (fs->pixelformat != ISP_FOURCC_NV12 &&
 	    fs->pixelformat != ISP_FOURCC_YUYV))
 		return (EINVAL);
 	fs->type = 1;	/* V4L2_FRMSIZE_TYPE_DISCRETE */
-	fs->discrete.width = ISP_WIDTH;
-	fs->discrete.height = ISP_HEIGHT;
+	fs->discrete.width = isp_sizes[fs->index].w;
+	fs->discrete.height = isp_sizes[fs->index].h;
 	return (0);
 }
 
@@ -912,7 +959,11 @@ amdisp_enum_frameintervals(device_t dev, struct video_frmivalenum *fi)
 {
 	if (fi->index != 0 || (fi->pixelformat != ISP_FOURCC_NV12 &&
 	    fi->pixelformat != ISP_FOURCC_YUYV) ||
-	    fi->width != ISP_WIDTH || fi->height != ISP_HEIGHT)
+	    amdisp_closest_size(fi->width, fi->height) < 0 ||
+	    isp_sizes[amdisp_closest_size(fi->width, fi->height)].w !=
+	    fi->width ||
+	    isp_sizes[amdisp_closest_size(fi->width, fi->height)].h !=
+	    fi->height)
 		return (EINVAL);
 	fi->type = 1;	/* V4L2_FRMIVAL_TYPE_DISCRETE */
 	fi->discrete.numerator = 1;
