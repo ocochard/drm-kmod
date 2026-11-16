@@ -133,6 +133,8 @@ static void *isp_meta_bo[ISP_NMETA], *isp_frame_bo[ISP_NFRAME];
 static uint64_t isp_meta_gpu[ISP_NMETA], isp_frame_gpu[ISP_NFRAME];
 static void *isp_meta_cpu[ISP_NMETA], *isp_frame_cpu[ISP_NFRAME];
 static int isp_last_frame = -1;
+static int isp_last_meta = -1;
+static uint8_t isp_meta_snap[4096];	/* last frame's meta info */
 static int isp_nframes, isp_requeue;
 static struct video_device *isp_vd;
 static uint32_t isp_video_seq;
@@ -381,6 +383,8 @@ isp_frame_done(uint64_t meta_gpu)
 		    "%llu\n", m[0], status, w, h, j,
 		    (unsigned long long)(sum / (ISP_Y_SIZE / 4093 + 1)));
 	isp_last_frame = j;
+	isp_last_meta = i;
+	memcpy(isp_meta_snap, m, sizeof(isp_meta_snap));
 	if (isp_vd != NULL && status == 3) {
 		struct video_buf *vb;
 		sbintime_t t0, now;
@@ -810,6 +814,18 @@ isp_log_sysctl(SYSCTL_HANDLER_ARGS)
 SYSCTL_PROC(_hw_amdisp, OID_AUTO, log,
     CTLTYPE_OPAQUE | CTLFLAG_RD | CTLFLAG_MPSAFE, NULL, 0, isp_log_sysctl,
     "", "ISP firmware log ring");
+
+/* The meta info of the last finished frame (first 4 KB), for analysis. */
+static int
+isp_meta_sysctl(SYSCTL_HANDLER_ARGS)
+{
+	if (isp_last_meta < 0)
+		return (ENOENT);
+	return (SYSCTL_OUT(req, isp_meta_snap, sizeof(isp_meta_snap)));
+}
+SYSCTL_PROC(_hw_amdisp, OID_AUTO, meta,
+    CTLTYPE_OPAQUE | CTLFLAG_RD | CTLFLAG_MPSAFE, NULL, 0, isp_meta_sysctl,
+    "", "Meta info of the last ISP frame (4 KB)");
 
 SYSCTL_PROC(_hw_amdisp, OID_AUTO, frame,
     CTLTYPE_OPAQUE | CTLFLAG_RD | CTLFLAG_MPSAFE, NULL, 0, isp_frame_sysctl,
