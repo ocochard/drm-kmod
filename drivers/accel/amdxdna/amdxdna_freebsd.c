@@ -171,3 +171,33 @@ amdxdna_freebsd_gem_uva(struct amdxdna_gem_obj *abo)
 	vm_map_unlock_read(map);
 	return (uva);
 }
+
+/*
+ * PCI revision as a sysfs-like attribute.  XRT tells NPU generations apart
+ * by (device, revision) and reads "revision" next to the driver's other
+ * attributes, sys.device.<nameunit>.<attr>; %pnpinfo has no revision.
+ */
+#include <linux/pci.h>
+
+static int
+amdxdna_sysctl_revision(SYSCTL_HANDLER_ARGS)
+{
+	struct pci_dev *pdev = arg1;
+	char buf[8];
+
+	snprintf(buf, sizeof(buf), "0x%02x", pdev->revision);
+	return (sysctl_handle_string(oidp, buf, sizeof(buf), req));
+}
+
+void
+amdxdna_freebsd_sysfs_init(struct amdxdna_dev *xdna)
+{
+	struct pci_dev *pdev = to_pci_dev(xdna->ddev.dev);
+
+	if (pdev->dev.kobj.oidp == NULL)
+		return;
+	/* Removed with the kobject's sysctl node. */
+	SYSCTL_ADD_PROC(NULL, SYSCTL_CHILDREN(pdev->dev.kobj.oidp), OID_AUTO,
+	    "revision", CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_MPSAFE, pdev, 0,
+	    amdxdna_sysctl_revision, "A", "PCI revision ID");
+}

@@ -162,6 +162,7 @@ dma_buf_mmap(struct dma_buf *dmabuf, struct vm_area_struct *vma,
 struct amdxdna_dev;
 int amdxdna_freebsd_carveout_init(struct amdxdna_dev *xdna);
 void amdxdna_freebsd_carveout_fini(struct amdxdna_dev *xdna);
+void amdxdna_freebsd_sysfs_init(struct amdxdna_dev *xdna);
 
 #define	drm_fdinfo_print_size(p, prefix, stat, region, sz)		\
 	((void)(p), (void)(prefix), (void)(sz))

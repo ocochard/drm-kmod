@@ -470,6 +470,7 @@ static int amdxdna_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 	    &xdna->accel_alias, ddev->render->bsd_device, "accel/accel%d",
 	    device_get_unit(pdev->dev.bsddev)) != 0)
 		XDNA_WARN(xdna, "Cannot create /dev/accel alias");
+	amdxdna_freebsd_sysfs_init(xdna);
 #endif
 	amdxdna_debugfs_init(xdna);
 	return 0;
