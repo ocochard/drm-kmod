@@ -23,7 +23,19 @@
 #include <sys/errno.h>
 #include <machine/atomic.h>
 
+#include <sys/bus.h>
+#include <sys/kthread.h>
+#include <sys/lock.h>
+#include <sys/mutex.h>
+#include <sys/proc.h>
+
+#include <dev/video/video.h>
+
 #include "amdgpu_isp_freebsd.h"
+#include "video_if.h"
+#include "gpio_if.h"
+
+#include <sys/gpio.h>
 
 #define	ISP_RD(off)		amdgpu_isp_fbsd_rd(off)
 #define	ISP_WR(off, v)		amdgpu_isp_fbsd_wr((off), (v))
@@ -104,6 +116,8 @@ static uint64_t isp_meta_gpu[ISP_NMETA], isp_frame_gpu[ISP_NFRAME];
 static void *isp_meta_cpu[ISP_NMETA], *isp_frame_cpu[ISP_NFRAME];
 static int isp_last_frame = -1;
 static int isp_nframes, isp_requeue;
+static struct video_device *isp_vd;
+static uint32_t isp_video_seq;
 
 static SYSCTL_NODE(_hw, OID_AUTO, amdisp, CTLFLAG_RW | CTLFLAG_MPSAFE, 0,
     "AMD ISP 4.1 camera test");
@@ -230,6 +244,29 @@ isp_poll_resp_type(int timeout_ms, uint32_t want)
 	return (ETIMEDOUT);
 }
 
+/* Read the responses already in the ring, without waiting. */
+static void
+isp_service(void)
+{
+	uint32_t e[ISP_ENTRY_SIZE / 4], rptr, wptr, st;
+	uint8_t *ring;
+
+	ring = (uint8_t *)isp_ring_cpu + ISP_RESP_SLOT * ISP_RING_SLOT;
+	st = ISP_RD(ISP_INT_STATUS);
+	if (st != 0)
+		ISP_WR(ISP_INT_ACK, st);
+	rptr = ISP_RD(ISP_RESP_RPTR);
+	wptr = ISP_RD(ISP_RESP_WPTR);
+	while (rptr != wptr) {
+		rmb();
+		memcpy(e, ring + rptr, sizeof(e));
+		rptr = (rptr + ISP_ENTRY_SIZE) % ISP_RING_SIZE;
+		ISP_WR(ISP_RESP_RPTR, rptr);
+		if (e[1] == ISP_RESP_FRAME_DONE)
+			isp_frame_done((uint64_t)e[3] << 32 | e[2]);
+	}
+}
+
 static int
 isp_poll_resp(int timeout_ms)
 {
@@ -316,6 +353,18 @@ isp_frame_done(uint64_t meta_gpu)
 		    "%llu\n", m[0], status, w, h, j,
 		    (unsigned long long)(sum / (ISP_Y_SIZE / 4093 + 1)));
 	isp_last_frame = j;
+	if (isp_vd != NULL && status == 3) {
+		struct video_buf *vb;
+
+		vb = video_buf_acquire(isp_vd);
+		if (vb != NULL) {
+			if (video_buf_write(vb, 0, f, ISP_FRAME_SIZE) != 0)
+				video_buf_error(vb);
+			else
+				video_buf_done(vb, ISP_FRAME_SIZE,
+				    isp_video_seq++);
+		}
+	}
 	if (isp_requeue) {
 		isp_requeue_buf(ISP_BUF_TYPE_META, isp_meta_gpu[i],
 		    ISP_META_SIZE);
@@ -431,12 +480,12 @@ isp_watch_fast(int ms)
  * buffers, four frame buffers, start.
  */
 static int
-isp_one_frame(void)
+isp_stream_setup(void)
 {
 	uint32_t cfg[5] = { 1, 0, 0x5f91, 1, 0 };
 	uint32_t prop[7] = { 0, 1, ISP_WIDTH, ISP_HEIGHT, ISP_WIDTH,
 	    ISP_WIDTH, 0 };
-	uint32_t en[2] = { 0, 1 }, dis[2] = { 0, 0 };
+	uint32_t en[2] = { 0, 1 };
 	uint32_t p[9];
 	uint64_t uv;
 	int i, r;
@@ -451,7 +500,6 @@ isp_one_frame(void)
 	MDELAY(10);
 	if ((r = isp_send_pool()) != 0)
 		return (r);
-	isp_watch_i2c(5);	/* state before any command */
 	if ((r = isp_send_cmd(ISP_CMD_SET_STREAM_CONFIG, cfg,
 	    nitems(cfg))) != 0)
 		return (r);
@@ -496,10 +544,27 @@ isp_one_frame(void)
 		if ((r = isp_cmd_wait(ISP_CMD_SEND_BUFFER, p, 9)) != 0)
 			return (r);
 	}
-	if ((r = isp_cmd_wait(ISP_CMD_START_STREAM, NULL, 0)) != 0)
+	return (isp_cmd_wait(ISP_CMD_START_STREAM, NULL, 0));
+}
+
+/* Disable the preview channel and stop the stream. */
+static void
+isp_stream_stop_cmds(void)
+{
+	uint32_t dis[2] = { 0, 0 };
+
+	isp_cmd_wait(ISP_CMD_ENABLE_OUT_CHAN, dis, nitems(dis));
+	isp_cmd_wait(ISP_CMD_STOP_STREAM, NULL, 0);
+}
+
+/* Test: set up a stream, take 90 frames, stop. */
+static int
+isp_one_frame(void)
+{
+	int i, r;
+
+	if ((r = isp_stream_setup()) != 0)
 		return (r);
-	isp_watch_i2c(1500);
-	isp_dump_regs("1.5 s after START_STREAM");
 	/* Stream 90 frames (3 s), giving each buffer back as it completes. */
 	isp_nframes = 0;
 	isp_requeue = 1;
@@ -508,9 +573,7 @@ isp_one_frame(void)
 			break;
 	isp_requeue = 0;
 	printf("amdisp: %d frames\n", isp_nframes);
-
-	isp_cmd_wait(ISP_CMD_ENABLE_OUT_CHAN, dis, nitems(dis));
-	isp_cmd_wait(ISP_CMD_STOP_STREAM, NULL, 0);
+	isp_stream_stop_cmds();
 	return (r);
 }
 
@@ -687,27 +750,270 @@ SYSCTL_PROC(_hw_amdisp, OID_AUTO, boot,
     "ISP boot test: 1 boots the ISP firmware, 0 stops it");
 
 
-static int
-amdisp_modevent(module_t mod, int type, void *data)
+/*
+ * video(4) driver.  One mode: NV12 1920x1080 at 30 frames per second.  A
+ * kernel thread reads the response ring every millisecond while streaming
+ * (the ISP interrupt is not routed through amdgpu yet).
+ */
+#define	ISP_FOURCC_NV12		0x3231564e	/* 'NV12' */
+
+static struct proc *isp_thread;
+static volatile int isp_streaming;
+
+static void
+isp_poll_thread(void *arg __unused)
 {
-	switch (type) {
-	case MOD_LOAD:
-		if (amdgpu_isp_fbsd_present() != 0)
-			printf("amdisp: amdgpu has no ISP 4.1 block\n");
-		return (0);
-	case MOD_UNLOAD:
-		if (isp_booted) {
-			isp_stop();
-			isp_booted = 0;
-		}
-		return (0);
-	default:
-		return (EOPNOTSUPP);
+	while (isp_streaming) {
+		isp_service();
+		pause("amdisp", 1);
 	}
+	isp_thread = NULL;
+	wakeup(&isp_thread);
+	kproc_exit(0);
 }
 
-static moduledata_t amdisp_mod = { "amdisp", amdisp_modevent, NULL };
-DECLARE_MODULE(amdisp, amdisp_mod, SI_SUB_DRIVERS, SI_ORDER_ANY);
+static void
+amdisp_fill_format(struct video_format *fmt)
+{
+	memset(fmt, 0, sizeof(*fmt));
+	fmt->pixelformat = ISP_FOURCC_NV12;
+	fmt->width = ISP_WIDTH;
+	fmt->height = ISP_HEIGHT;
+	fmt->bytesperline = ISP_WIDTH;
+	fmt->sizeimage = ISP_FRAME_SIZE;
+	fmt->field = 1;		/* V4L2_FIELD_NONE */
+	fmt->colorspace = 8;	/* V4L2_COLORSPACE_SRGB */
+	strlcpy(fmt->description, "Y/UV 4:2:0", sizeof(fmt->description));
+}
+
+static int
+amdisp_querycap(device_t dev, struct video_caps *caps)
+{
+	memset(caps, 0, sizeof(*caps));
+	strlcpy(caps->driver, "amdisp", sizeof(caps->driver));
+	strlcpy(caps->card, "AMD ISP 4.1 camera", sizeof(caps->card));
+	strlcpy(caps->bus_info, "platform:amdisp", sizeof(caps->bus_info));
+	caps->version = (1 << 16);
+	caps->capabilities = VIDEO_CAP_CAPTURE | VIDEO_CAP_READWRITE |
+	    VIDEO_CAP_STREAMING;
+	return (0);
+}
+
+static int
+amdisp_enum_format(device_t dev, uint32_t index, struct video_format *fmt)
+{
+	if (index != 0)
+		return (EINVAL);
+	amdisp_fill_format(fmt);
+	return (0);
+}
+
+static int
+amdisp_get_format(device_t dev, struct video_format *fmt)
+{
+	amdisp_fill_format(fmt);
+	return (0);
+}
+
+static int
+amdisp_set_format(device_t dev, const struct video_format *fmt)
+{
+	return (0);	/* only one mode; try_format reports it */
+}
+
+static int
+amdisp_enum_framesizes(device_t dev, struct video_frmsizeenum *fs)
+{
+	if (fs->index != 0 || fs->pixelformat != ISP_FOURCC_NV12)
+		return (EINVAL);
+	fs->type = 1;	/* V4L2_FRMSIZE_TYPE_DISCRETE */
+	fs->discrete.width = ISP_WIDTH;
+	fs->discrete.height = ISP_HEIGHT;
+	return (0);
+}
+
+static int
+amdisp_enum_frameintervals(device_t dev, struct video_frmivalenum *fi)
+{
+	if (fi->index != 0 || fi->pixelformat != ISP_FOURCC_NV12 ||
+	    fi->width != ISP_WIDTH || fi->height != ISP_HEIGHT)
+		return (EINVAL);
+	fi->type = 1;	/* V4L2_FRMIVAL_TYPE_DISCRETE */
+	fi->discrete.numerator = 1;
+	fi->discrete.denominator = 30;
+	return (0);
+}
+
+static int
+amdisp_get_parm(device_t dev, struct video_fract *fract)
+{
+	fract->numerator = 1;
+	fract->denominator = 30;
+	return (0);
+}
+
+static int
+amdisp_enum_input(device_t dev, uint32_t index, struct video_input *inp)
+{
+	if (index != 0)
+		return (EINVAL);
+	memset(inp, 0, sizeof(*inp));
+	strlcpy(inp->name, "Camera", sizeof(inp->name));
+	inp->type = VIDEO_INPUT_TYPE_CAMERA;
+	return (0);
+}
+
+static int
+amdisp_get_input(device_t dev, uint32_t *index)
+{
+	*index = 0;
+	return (0);
+}
+
+static int
+amdisp_set_input(device_t dev, uint32_t index)
+{
+	return (index == 0 ? 0 : EINVAL);
+}
+
+/*
+ * AMD GPIO 85 enables the camera module (Linux amdgpu's "enable_isp"
+ * lookup).  Linux raises it at each stream start and drops it at each stop;
+ * left high between streams, the next SET_STREAM_CONFIG gets no answer.
+ */
+#define	ISP_ENABLE_GPIO		85
+
+static void
+isp_enable_gpio(int on)
+{
+	device_t gpio;
+
+	gpio = devclass_get_device(devclass_find("gpio"), 0);
+	if (gpio == NULL) {
+		printf("amdisp: no gpio0 (kldload amdgpio)\n");
+		return;
+	}
+	GPIO_PIN_SETFLAGS(gpio, ISP_ENABLE_GPIO, GPIO_PIN_OUTPUT);
+	GPIO_PIN_SET(gpio, ISP_ENABLE_GPIO, on ? GPIO_PIN_HIGH : GPIO_PIN_LOW);
+}
+
+static int
+amdisp_start_stream(device_t dev)
+{
+	int r;
+
+	if (isp_booted)
+		return (EBUSY);	/* the sysctl test owns the ISP */
+	isp_enable_gpio(0);
+	MDELAY(10);
+	isp_enable_gpio(1);
+	MDELAY(10);
+	isp_booted = 1;
+	if ((r = isp_boot()) != 0 || (r = isp_stream_setup()) != 0) {
+		isp_stop();
+		isp_booted = 0;
+		isp_enable_gpio(0);
+		return (r);
+	}
+	isp_video_seq = 0;
+	isp_requeue = 1;
+	isp_streaming = 1;
+	r = kproc_create(isp_poll_thread, NULL, &isp_thread, 0, 0, "amdisp");
+	if (r != 0) {
+		isp_streaming = 0;
+		isp_requeue = 0;
+		isp_stream_stop_cmds();
+		isp_stop();
+		isp_booted = 0;
+	}
+	return (r);
+}
+
+static void
+amdisp_stop_stream(device_t dev)
+{
+	if (!isp_streaming)
+		return;
+	isp_streaming = 0;
+	while (isp_thread != NULL)
+		tsleep(&isp_thread, 0, "amdispst", hz / 10);
+	isp_requeue = 0;
+	isp_stream_stop_cmds();
+	isp_stop();
+	isp_booted = 0;
+	isp_enable_gpio(0);
+}
+
+static void
+amdisp_identify(driver_t *driver, device_t parent)
+{
+	if (device_find_child(parent, "amdisp", DEVICE_UNIT_ANY) == NULL)
+		BUS_ADD_CHILD(parent, 0, "amdisp", DEVICE_UNIT_ANY);
+}
+
+static int
+amdisp_probe(device_t dev)
+{
+	if (amdgpu_isp_fbsd_present() != 0)
+		return (ENXIO);
+	device_set_desc(dev, "AMD ISP 4.1 camera (test)");
+	return (BUS_PROBE_NOWILDCARD);
+}
+
+static int
+amdisp_attach(device_t dev)
+{
+	return (video_register(dev, &isp_vd));
+}
+
+static int
+amdisp_detach(device_t dev)
+{
+	amdisp_stop_stream(dev);
+	if (isp_booted) {
+		isp_stop();
+		isp_booted = 0;
+	}
+	if (isp_vd != NULL) {
+		video_unregister(isp_vd);
+		isp_vd = NULL;
+	}
+	return (0);
+}
+
+static device_method_t amdisp_methods[] = {
+	DEVMETHOD(device_identify,	amdisp_identify),
+	DEVMETHOD(device_probe,		amdisp_probe),
+	DEVMETHOD(device_attach,	amdisp_attach),
+	DEVMETHOD(device_detach,	amdisp_detach),
+
+	DEVMETHOD(video_querycap,	amdisp_querycap),
+	DEVMETHOD(video_enum_format,	amdisp_enum_format),
+	DEVMETHOD(video_get_format,	amdisp_get_format),
+	DEVMETHOD(video_try_format,	amdisp_get_format),
+	DEVMETHOD(video_set_format,	amdisp_set_format),
+	DEVMETHOD(video_enum_framesizes, amdisp_enum_framesizes),
+	DEVMETHOD(video_enum_frameintervals, amdisp_enum_frameintervals),
+	DEVMETHOD(video_get_parm,	amdisp_get_parm),
+	DEVMETHOD(video_set_parm,	amdisp_get_parm),
+	DEVMETHOD(video_enum_input,	amdisp_enum_input),
+	DEVMETHOD(video_get_input,	amdisp_get_input),
+	DEVMETHOD(video_set_input,	amdisp_set_input),
+	DEVMETHOD(video_start_stream,	amdisp_start_stream),
+	DEVMETHOD(video_stop_stream,	amdisp_stop_stream),
+
+	DEVMETHOD_END
+};
+
+static driver_t amdisp_driver = {
+	"amdisp",
+	amdisp_methods,
+	0,
+};
+
+DRIVER_MODULE(amdisp, nexus, amdisp_driver, NULL, NULL);
 MODULE_VERSION(amdisp, 1);
+MODULE_DEPEND(amdisp, video, 1, 1, 1);
+MODULE_DEPEND(amdisp, gpiobus, 1, 1, 1);
 MODULE_DEPEND(amdisp, amdgpu_isp, AMDGPU_ISP_FBSD_VERSION,
     AMDGPU_ISP_FBSD_VERSION, AMDGPU_ISP_FBSD_VERSION);
