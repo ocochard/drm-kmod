@@ -123,6 +123,7 @@ static int isp_last_frame = -1;
 static int isp_nframes, isp_requeue;
 static struct video_device *isp_vd;
 static uint32_t isp_video_seq;
+static u_long isp_intr_count;
 static int isp_yuyv;		/* current format: 0 NV12, 1 YUYV */
 #define	ISP_CUR_SIZE	(isp_yuyv ? ISP_YUYV_SIZE : ISP_FRAME_SIZE)
 static sbintime_t isp_last_done;
@@ -789,6 +790,9 @@ SYSCTL_PROC(_hw_amdisp, OID_AUTO, frame,
     CTLTYPE_OPAQUE | CTLFLAG_RD | CTLFLAG_MPSAFE, NULL, 0, isp_frame_sysctl,
     "", "Last ISP frame (NV12 1920x1080)");
 
+SYSCTL_ULONG(_hw_amdisp, OID_AUTO, intr_count, CTLFLAG_RD, &isp_intr_count,
+    0, "ISP interrupts received through amdgpu");
+
 SYSCTL_PROC(_hw_amdisp, OID_AUTO, boot,
     CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_MPSAFE, NULL, 0, isp_boot_sysctl, "I",
     "ISP boot test: 1 boots the ISP firmware, 0 stops it");
@@ -804,13 +808,26 @@ SYSCTL_PROC(_hw_amdisp, OID_AUTO, boot,
 
 static struct proc *isp_thread;
 static volatile int isp_streaming;
+static int isp_wchan;		/* sleep channel of the service thread */
+
+/*
+ * amdgpu calls this from its interrupt handler for each ISP ring-buffer
+ * interrupt: wake the service thread, which reads the responses.
+ */
+static void
+isp_intr(void *arg __unused)
+{
+	isp_intr_count++;
+	wakeup(&isp_wchan);
+}
 
 static void
 isp_poll_thread(void *arg __unused)
 {
 	while (isp_streaming) {
 		isp_service();
-		pause("amdisp", 1);
+		/* Woken by isp_intr(); the timeout is only a safety net. */
+		tsleep(&isp_wchan, 0, "amdisp", hz / 10);
 	}
 	isp_thread = NULL;
 	wakeup(&isp_thread);
@@ -977,6 +994,7 @@ amdisp_start_stream(device_t dev)
 	isp_video_seq = 0;
 	isp_requeue = 1;
 	isp_streaming = 1;
+	amdgpu_isp_fbsd_set_intr(isp_intr, NULL);
 	r = kproc_create(isp_poll_thread, NULL, &isp_thread, 0, 0, "amdisp");
 	if (r != 0) {
 		isp_streaming = 0;
@@ -994,6 +1012,8 @@ amdisp_stop_stream(device_t dev)
 	if (!isp_streaming)
 		return;
 	isp_streaming = 0;
+	amdgpu_isp_fbsd_set_intr(NULL, NULL);
+	wakeup(&isp_wchan);
 	while (isp_thread != NULL)
 		tsleep(&isp_thread, 0, "amdispst", hz / 10);
 	isp_requeue = 0;

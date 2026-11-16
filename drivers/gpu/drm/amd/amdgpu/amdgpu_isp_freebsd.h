@@ -14,7 +14,7 @@
 
 #include <sys/types.h>
 
-#define	AMDGPU_ISP_FBSD_VERSION		1
+#define	AMDGPU_ISP_FBSD_VERSION		2
 
 /* SMU requests. */
 #define	AMDGPU_ISP_FBSD_POWER_UP	0	/* PowerUpIspByTile */
@@ -31,5 +31,10 @@ int		amdgpu_isp_fbsd_alloc(size_t size, void **handle,
 		    uint64_t *gpu, void **cpu);
 void		amdgpu_isp_fbsd_free(void **handle, uint64_t *gpu, void **cpu);
 int		amdgpu_isp_fbsd_smu(int req, uint32_t arg);
+/*
+ * Called from amdgpu's interrupt handler for every ISP ring-buffer
+ * interrupt (IH client ISP, sources WPT9-WPT16); NULL to stop.
+ */
+void		amdgpu_isp_fbsd_set_intr(void (*fn)(void *), void *arg);
 
 #endif /* _AMDGPU_ISP_FREEBSD_H_ */

@@ -12,6 +12,8 @@
 
 #include "amdgpu.h"
 #include "amdgpu_isp.h"
+#include "ivsrcid/isp/irqsrcs_isp_4_1.h"
+#include "soc15_ih_clientid.h"
 /* smu_cmn.h exposes its helpers only to the SMU layers. */
 #define	SWSMU_CODE_LAYER_L2
 #include "amdgpu_smu.h"
@@ -84,10 +86,71 @@ amdgpu_isp_fbsd_smu(int req, uint32_t arg)
 	    msg[req], arg, NULL));
 }
 
+static void (*isp_intr_fn)(void *);
+static void *isp_intr_arg;
+static bool isp_intr_registered;
+
+void
+amdgpu_isp_fbsd_set_intr(void (*fn)(void *), void *arg)
+{
+	isp_intr_arg = arg;
+	isp_intr_fn = fn;
+}
+
+static int
+isp_irq_set(struct amdgpu_device *adev, struct amdgpu_irq_src *src,
+    unsigned type, enum amdgpu_interrupt_state state)
+{
+	return (0);	/* the camera driver enables its interrupts itself */
+}
+
+static int
+isp_irq_process(struct amdgpu_device *adev, struct amdgpu_irq_src *src,
+    struct amdgpu_iv_entry *entry)
+{
+	void (*fn)(void *) = isp_intr_fn;
+
+	if (fn != NULL)
+		fn(isp_intr_arg);
+	return (1);
+}
+
+static const struct amdgpu_irq_src_funcs isp_irq_funcs = {
+	.set = isp_irq_set,
+	.process = isp_irq_process,
+};
+
+static struct amdgpu_irq_src isp_irq_src = {
+	.funcs = &isp_irq_funcs,
+};
+
 void
 amdgpu_isp_freebsd_attach(struct amdgpu_device *adev)
 {
+	static const unsigned int srcid[] = {
+		ISP_4_1__SRCID__ISP_RINGBUFFER_WPT9,
+		ISP_4_1__SRCID__ISP_RINGBUFFER_WPT10,
+		ISP_4_1__SRCID__ISP_RINGBUFFER_WPT11,
+		ISP_4_1__SRCID__ISP_RINGBUFFER_WPT12,
+		ISP_4_1__SRCID__ISP_RINGBUFFER_WPT13,
+		ISP_4_1__SRCID__ISP_RINGBUFFER_WPT14,
+		ISP_4_1__SRCID__ISP_RINGBUFFER_WPT15,
+		ISP_4_1__SRCID__ISP_RINGBUFFER_WPT16,
+	};
+	int i, r;
+
 	isp_adev = adev;
+	/* hw_init also runs on resume: register the sources once. */
+	if (isp_intr_registered)
+		return;
+	for (i = 0; i < nitems(srcid); i++) {
+		r = amdgpu_irq_add_id(adev, SOC15_IH_CLIENTID_ISP, srcid[i],
+		    &isp_irq_src);
+		if (r != 0)
+			DRM_ERROR("ISP: cannot register interrupt source %u: %d\n",
+			    srcid[i], r);
+	}
+	isp_intr_registered = true;
 }
 
 void
