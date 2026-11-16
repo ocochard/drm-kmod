@@ -223,6 +223,8 @@ isp_send_cmd(uint32_t id, const uint32_t *payload,
 }
 
 static void isp_frame_done(uint64_t meta_gpu);
+/* Sequence number of the command isp_cmd_wait() waits for (word 2). */
+static uint32_t isp_wait_seq;
 static void isp_dump_regs(const char *when);
 static int isp_send_pool(void);
 
@@ -259,7 +261,9 @@ isp_poll_resp_type(int timeout_ms, uint32_t want)
 			ISP_WR(ISP_RESP_RPTR, rptr);
 			if (e[1] == ISP_RESP_FRAME_DONE)
 				isp_frame_done((uint64_t)e[3] << 32 | e[2]);
-			if (want == 0 || e[1] == want)
+			/* A "command done" counts only for the awaited command. */
+			if ((want == 0 || e[1] == want) &&
+			    (isp_wait_seq == 0 || e[2] == isp_wait_seq))
 				n++;
 		}
 		if (n > 0)
@@ -308,8 +312,11 @@ isp_cmd_wait(uint32_t id, const uint32_t *p,
 	int r;
 
 	r = isp_send_cmd(id, p, n);
-	if (r == 0)
+	if (r == 0) {
+		isp_wait_seq = isp_cmd_seq;
 		r = isp_poll_resp_type(2000, ISP_RESP_CMD_DONE);
+		isp_wait_seq = 0;
+	}
 	return (r);
 }
 
