@@ -650,6 +650,18 @@ isp_send_pool(void)
 			return (r);
 		}
 	}
+	{
+		/* XXX test: is the new pool zeroed? Then clear it anyway. */
+		const uint8_t *b = isp_pool_cpu;
+		size_t nz = 0;
+
+		for (size_t k = 0; k < ISP_POOL_SIZE; k += 4096)
+			if (b[k] != 0)
+				nz++;
+		printf("amdisp: pool pages with a non-zero first byte: %zu of %d\n",
+		    nz, ISP_POOL_SIZE / 4096);
+		memset(isp_pool_cpu, 0, ISP_POOL_SIZE);
+	}
 	p[0] = ISP_BUF_TYPE_POOL;
 	p[1] = 0;
 	p[2] = 4;
