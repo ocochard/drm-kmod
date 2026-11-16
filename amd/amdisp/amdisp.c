@@ -118,6 +118,9 @@ static int isp_last_frame = -1;
 static int isp_nframes, isp_requeue;
 static struct video_device *isp_vd;
 static uint32_t isp_video_seq;
+static sbintime_t isp_last_done;
+static uint64_t isp_gap_us, isp_copy_us;
+static u_int isp_timed, isp_nobuf;
 
 static SYSCTL_NODE(_hw, OID_AUTO, amdisp, CTLFLAG_RW | CTLFLAG_MPSAFE, 0,
     "AMD ISP 4.1 camera test");
@@ -197,6 +200,7 @@ isp_send_cmd(uint32_t id, const uint32_t *payload,
 }
 
 static void isp_frame_done(uint64_t meta_gpu);
+static void isp_dump_regs(const char *when);
 static int isp_send_pool(void);
 
 /* Poll the response ring for up to timeout_ms, printing each response. */
@@ -336,7 +340,7 @@ isp_frame_done(uint64_t meta_gpu)
 	h = m[0x38 / 4];
 	y = (uint64_t)m[0x54 / 4] << 32 | m[0x50 / 4];
 	for (j = 0; j < ISP_NFRAME; j++)
-		if (isp_frame_gpu[j] == y)
+		if (isp_frame_bo[j] != NULL && isp_frame_gpu[j] == y)
 			break;
 	if (j == ISP_NFRAME) {
 		/* Meta info came back without a frame (no buffer queued). */
@@ -355,14 +359,35 @@ isp_frame_done(uint64_t meta_gpu)
 	isp_last_frame = j;
 	if (isp_vd != NULL && status == 3) {
 		struct video_buf *vb;
+		sbintime_t t0, now;
 
+		/* XXX timing debug: frame interval and copy time. */
+		t0 = sbinuptime();
+		if (isp_last_done != 0)
+			isp_gap_us += (t0 - isp_last_done) / SBT_1US;
+		isp_last_done = t0;
 		vb = video_buf_acquire(isp_vd);
+		if (vb == NULL)
+			isp_nobuf++;
 		if (vb != NULL) {
 			if (video_buf_write(vb, 0, f, ISP_FRAME_SIZE) != 0)
 				video_buf_error(vb);
 			else
 				video_buf_done(vb, ISP_FRAME_SIZE,
 				    isp_video_seq++);
+		}
+		now = sbinuptime();
+		isp_copy_us += (now - t0) / SBT_1US;
+		if (isp_video_seq == 90)
+			isp_dump_regs("while streaming (frame 90)");
+		if (++isp_timed == 60) {
+			printf("amdisp: 60 frames: interval %ju us, copy %ju us, "
+			    "no buffer %u\n", (uintmax_t)isp_gap_us / 59,
+			    (uintmax_t)isp_copy_us / 60, isp_nobuf);
+			isp_timed = 0;
+			isp_gap_us = isp_copy_us = 0;
+			isp_last_done = 0;
+			isp_nobuf = 0;
 		}
 	}
 	if (isp_requeue) {
