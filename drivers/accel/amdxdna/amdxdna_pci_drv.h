@@ -118,6 +118,10 @@ struct amdxdna_dev {
 	struct cdev			*accel_alias;	/* /dev/accel/accelN */
 	struct vm_page			*carveout_pages;
 	unsigned long			carveout_npages;
+	struct mutex			pm_lock;	/* runtime PM state */
+	atomic_t			pm_usage;
+	bool				pm_suspended;
+	struct delayed_work		pm_work;	/* autosuspend */
 #endif
 	struct amdxdna_dev_hdl		*dev_handle;
 	const struct amdxdna_dev_info	*dev_info;

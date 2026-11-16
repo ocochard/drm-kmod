@@ -433,6 +433,7 @@ static int amdxdna_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 		return ret;
 
 #ifdef __FreeBSD__
+	amdxdna_pm_setup(xdna);
 	ret = amdxdna_freebsd_carveout_init(xdna);
 	if (ret)
 		goto iommu_fini;
@@ -478,6 +479,9 @@ static int amdxdna_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 failed_sysfs_fini:
 	amdxdna_sysfs_fini(xdna);
 failed_dev_fini:
+#ifdef __FreeBSD__
+	amdxdna_pm_quiesce(xdna);
+#endif
 	mutex_lock(&xdna->dev_lock);
 	xdna->dev_info->ops->fini(xdna);
 	mutex_unlock(&xdna->dev_lock);
@@ -494,6 +498,7 @@ static void amdxdna_remove(struct pci_dev *pdev)
 #ifdef __FreeBSD__
 	if (xdna->accel_alias != NULL)
 		destroy_dev(xdna->accel_alias);
+	amdxdna_pm_quiesce(xdna);
 #endif
 	drm_dev_unplug(&xdna->ddev);
 	amdxdna_sysfs_fini(xdna);
@@ -513,7 +518,11 @@ static void amdxdna_remove(struct pci_dev *pdev)
 }
 
 static const struct dev_pm_ops amdxdna_pm_ops = {
+#ifdef __linux__
 	SYSTEM_SLEEP_PM_OPS(amdxdna_pm_suspend, amdxdna_pm_resume)
+#else
+	SYSTEM_SLEEP_PM_OPS(amdxdna_pm_sys_suspend, amdxdna_pm_sys_resume)
+#endif
 	RUNTIME_PM_OPS(amdxdna_pm_suspend, amdxdna_pm_resume, NULL)
 };
 
